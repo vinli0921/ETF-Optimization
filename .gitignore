@@ -43,6 +43,7 @@ Thumbs.db
 
 # Environment
 venv/
+.venv/
 env/
 ENV/
 .env
