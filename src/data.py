@@ -160,7 +160,15 @@ def load_default_etfs(
     cache_dir: str = "data"
 ) -> pd.DataFrame:
     """
-    Convenience function to load default ETF set (VTI, BND, QQQ).
+    Convenience function to load default ETF set.
+
+    ETFs included:
+    - SPY: S&P 500 (US large-cap stocks)
+    - QQQ: NASDAQ-100 (US tech stocks)
+    - VTI: Vanguard Total Stock Market (broad US stocks)
+    - TLT: iShares 20+ Year Treasury Bond (long-term US bonds)
+    - BND: Vanguard Total Bond Market (broad US bonds)
+    - GLD: SPDR Gold Trust (gold)
 
     Args:
         start_date: Start date (YYYY-MM-DD)
@@ -174,7 +182,7 @@ def load_default_etfs(
         end_date = datetime.today().strftime('%Y-%m-%d')
 
     loader = ETFDataLoader(cache_dir=cache_dir)
-    tickers = ['VTI', 'BND', 'QQQ']
+    tickers = ['SPY', 'QQQ', 'VTI', 'TLT', 'BND', 'GLD']
 
     prices = loader.download_etfs(tickers, start_date, end_date)
 

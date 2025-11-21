@@ -8,8 +8,11 @@ from abc import ABC, abstractmethod
 import pandas as pd
 import numpy as np
 from typing import Optional, Dict
-from pypfopt import expected_returns, risk_models
+from pypfopt import expected_returns, risk_models, objective_functions
 from pypfopt.efficient_frontier import EfficientFrontier
+from sklearn.linear_model import Ridge
+from sklearn.covariance import LedoitWolf
+from sklearn.model_selection import TimeSeriesSplit
 
 
 class BaseStrategy(ABC):
@@ -116,27 +119,303 @@ class MeanVarianceStrategy(BaseStrategy):
     """
     Mean-variance optimization strategy.
 
-    Uses historical returns and covariances to find the maximum Sharpe ratio portfolio.
+    Uses historical returns and covariances to find the maximum Sharpe ratio
+    (or other mean-variance objectives) via PyPortfolioOpt.
     """
 
     def __init__(
         self,
         lookback_days: int = 252,
-        risk_free_rate: float = 0.02,
-        method: str = "max_sharpe"
+        risk_free_rate: float = 0.0,
+        method: str = "max_sharpe",
+        use_shrinkage: bool = True,
+        l2_gamma: float = 0.01,
+        max_weight: float = 0.7,
+        min_history_days: int = 30,
     ):
         """
         Initialize mean-variance strategy.
 
         Args:
-            lookback_days: Number of days of history to use for estimation
-            risk_free_rate: Annual risk-free rate for Sharpe calculation
-            method: Optimization method ('max_sharpe', 'min_volatility', 'efficient_risk')
+            lookback_days: Number of calendar days of history to use for estimation.
+            risk_free_rate: Annual risk-free rate for Sharpe calculation.
+            method: 'max_sharpe', 'min_volatility', or 'efficient_risk'.
+            use_shrinkage: Whether to use Ledoit-Wolf shrinkage covariance.
+            l2_gamma: Strength of L2 weight regularization (0 disables it).
+            max_weight: Upper bound per-asset (e.g., 0.7 = max 70% in one asset).
+                       NOTE: Must be at least 1/n_assets to be feasible!
+            min_history_days: Minimum number of rows required before optimizing.
         """
         super().__init__("Mean-Variance Optimization")
         self.lookback_days = lookback_days
         self.risk_free_rate = risk_free_rate
         self.method = method
+        self.use_shrinkage = use_shrinkage
+        self.l2_gamma = l2_gamma
+        self.max_weight = max_weight
+        self.min_history_days = min_history_days
+
+    def allocate(
+        self,
+        prices: pd.DataFrame,
+        current_date: Optional[pd.Timestamp] = None,
+        **kwargs
+    ) -> Dict[str, float]:
+
+        # Use only data up to current_date (inclusive)
+        if current_date is not None:
+            prices = prices.loc[:current_date]
+
+        # Use last lookback_days of history (by row count)
+        if len(prices) > self.lookback_days:
+            prices = prices.iloc[-self.lookback_days:]
+
+        # Require minimum history
+        if len(prices) < self.min_history_days:
+            print(f"Warning: Insufficient data ({len(prices)} days), using equal weights")
+            return EqualWeightStrategy().allocate(prices)
+
+        try:
+            # Expected returns (annualized)
+            mu = expected_returns.mean_historical_return(prices, frequency=252)
+
+            # Covariance matrix (annualized)
+            if self.use_shrinkage:
+                S = risk_models.CovarianceShrinkage(prices).ledoit_wolf()
+            else:
+                S = risk_models.sample_cov(prices, frequency=252)
+
+            # Ensure max_weight is feasible (at least 1/n_assets)
+            n_assets = len(prices.columns)
+            effective_max_weight = max(self.max_weight, 1.0 / n_assets + 0.01)
+
+            # Efficient frontier, long-only, limited concentration
+            ef = EfficientFrontier(mu, S, weight_bounds=(0, effective_max_weight))
+
+            # Optional L2 regularization to smooth weights
+            if self.l2_gamma is not None and self.l2_gamma > 0:
+                ef.add_objective(objective_functions.L2_reg, gamma=self.l2_gamma)
+
+            # Choose optimization objective
+            if self.method == "max_sharpe":
+                try:
+                    ef.max_sharpe(risk_free_rate=self.risk_free_rate)
+                except Exception:
+                    # Fallback to min_volatility if max_sharpe fails
+                    # (e.g., when all returns < risk-free rate)
+                    ef = EfficientFrontier(mu, S, weight_bounds=(0, effective_max_weight))
+                    if self.l2_gamma is not None and self.l2_gamma > 0:
+                        ef.add_objective(objective_functions.L2_reg, gamma=self.l2_gamma)
+                    ef.min_volatility()
+            elif self.method == "min_volatility":
+                ef.min_volatility()
+            elif self.method == "efficient_risk":
+                target_vol = kwargs.get("target_volatility", 0.15)
+                ef.efficient_risk(target_vol)
+            else:
+                raise ValueError(f"Unknown method: {self.method}")
+
+            # Clean and export weights
+            weights = ef.clean_weights()
+
+            # Ensure all tickers present
+            for ticker in prices.columns:
+                weights.setdefault(ticker, 0.0)
+
+            self.validate_weights(weights)
+            return weights
+
+        except Exception as e:
+            print(f"Warning: Optimization failed ({str(e)}), using equal weights")
+            return EqualWeightStrategy().allocate(prices)
+
+
+class PredictiveSharpeStrategy(BaseStrategy):
+    """
+    Regression-based Sharpe ratio optimization strategy.
+
+    Uses Ridge regression to predict expected returns from features (momentum,
+    volatility, rolling Sharpe), then optimizes for maximum Sharpe ratio using
+    those predictions with Ledoit-Wolf shrinkage covariance.
+
+    This approach aims to improve out-of-sample performance by:
+    1. Regularizing return predictions (Ridge regression)
+    2. Shrinking covariance estimates (Ledoit-Wolf)
+    3. Shrinking predicted returns toward the grand mean (James-Stein style)
+    """
+
+    def __init__(
+        self,
+        lookback_days: int = 252,
+        feature_window: int = 30,
+        risk_free_rate: float = 0.0,
+        ridge_alpha: float = 1.0,
+        shrinkage_intensity: float = 0.5,
+        max_weight: float = 0.7,
+        l2_gamma: float = 0.01,
+        min_history_days: int = 60,
+    ):
+        """
+        Initialize predictive Sharpe strategy.
+
+        Args:
+            lookback_days: Number of trading days of history to use for training.
+            feature_window: Rolling window for feature computation (momentum, vol).
+            risk_free_rate: Annual risk-free rate for Sharpe calculation.
+            ridge_alpha: Regularization strength for Ridge regression (higher = more regularization).
+            shrinkage_intensity: How much to shrink predicted returns toward grand mean (0-1).
+                0 = use raw predictions, 1 = use global mean for all assets.
+            max_weight: Maximum weight per asset (concentration limit).
+                       NOTE: Must be at least 1/n_assets to be feasible!
+            l2_gamma: L2 regularization on portfolio weights.
+            min_history_days: Minimum rows required before using predictions.
+        """
+        super().__init__("Predictive Sharpe (Ridge Regression)")
+        self.lookback_days = lookback_days
+        self.feature_window = feature_window
+        self.risk_free_rate = risk_free_rate
+        self.ridge_alpha = ridge_alpha
+        self.shrinkage_intensity = shrinkage_intensity
+        self.max_weight = max_weight
+        self.l2_gamma = l2_gamma
+        self.min_history_days = min_history_days
+
+        # Store trained models (one per asset)
+        self._models: Dict[str, Ridge] = {}
+
+    def _compute_features(self, prices: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute features for prediction.
+
+        Features per asset:
+        - Lagged returns (1, 5, 21 days)
+        - Rolling momentum (annualized)
+        - Rolling volatility (annualized)
+        - Rolling Sharpe ratio
+
+        Args:
+            prices: Historical price data
+
+        Returns:
+            DataFrame with features
+        """
+        returns = prices.pct_change()
+
+        features_list = []
+
+        for ticker in prices.columns:
+            ticker_returns = returns[ticker]
+
+            # Lagged returns
+            lag_1 = ticker_returns.shift(1)
+            lag_5 = ticker_returns.rolling(5).mean().shift(1)
+            lag_21 = ticker_returns.rolling(21).mean().shift(1)
+
+            # Rolling momentum (annualized)
+            momentum = ticker_returns.rolling(self.feature_window).mean().shift(1) * 252
+
+            # Rolling volatility (annualized)
+            volatility = ticker_returns.rolling(self.feature_window).std().shift(1) * np.sqrt(252)
+
+            # Rolling Sharpe
+            rolling_sharpe = momentum / volatility
+
+            # Combine into feature DataFrame
+            ticker_features = pd.DataFrame({
+                f'{ticker}_lag1': lag_1,
+                f'{ticker}_lag5': lag_5,
+                f'{ticker}_lag21': lag_21,
+                f'{ticker}_momentum': momentum,
+                f'{ticker}_volatility': volatility,
+                f'{ticker}_sharpe': rolling_sharpe,
+            })
+
+            features_list.append(ticker_features)
+
+        features = pd.concat(features_list, axis=1)
+        return features
+
+    def _train_models(self, prices: pd.DataFrame) -> Dict[str, float]:
+        """
+        Train Ridge regression models to predict returns.
+
+        Args:
+            prices: Historical price data
+
+        Returns:
+            Dictionary of predicted annualized returns per asset
+        """
+        returns = prices.pct_change()
+        features = self._compute_features(prices)
+
+        predictions = {}
+
+        for ticker in prices.columns:
+            # Get features for this asset
+            ticker_feature_cols = [col for col in features.columns if col.startswith(ticker)]
+            X = features[ticker_feature_cols]
+
+            # Target: next-day return
+            y = returns[ticker]
+
+            # Align X and y, drop NaNs
+            combined = pd.concat([X, y.rename('target')], axis=1).dropna()
+
+            if len(combined) < self.min_history_days:
+                # Not enough data, use historical mean
+                mean_return = returns[ticker].mean() * 252
+                predictions[ticker] = mean_return if not np.isnan(mean_return) else 0.0
+                continue
+
+            X_train = combined[ticker_feature_cols].values
+            y_train = combined['target'].values
+
+            # Train Ridge regression
+            model = Ridge(alpha=self.ridge_alpha)
+            model.fit(X_train, y_train)
+            self._models[ticker] = model
+
+            # Predict using most recent features
+            latest_features = X.iloc[-1:].values
+
+            if np.any(np.isnan(latest_features)):
+                # Features have NaN, use historical mean
+                mean_return = returns[ticker].mean() * 252
+                predictions[ticker] = mean_return if not np.isnan(mean_return) else 0.0
+            else:
+                # Predict and annualize
+                pred_daily = model.predict(latest_features)[0]
+                predictions[ticker] = pred_daily * 252
+
+        return predictions
+
+    def _apply_shrinkage(self, predictions: Dict[str, float]) -> Dict[str, float]:
+        """
+        Apply James-Stein style shrinkage to predicted returns.
+
+        Shrinks predictions toward the grand mean to reduce estimation error.
+
+        Args:
+            predictions: Raw predicted returns per asset
+
+        Returns:
+            Shrunk predictions
+        """
+        if not predictions:
+            return predictions
+
+        values = np.array(list(predictions.values()))
+        grand_mean = np.mean(values)
+
+        # Shrink toward grand mean
+        shrunk = {}
+        for ticker, pred in predictions.items():
+            shrunk[ticker] = (
+                (1 - self.shrinkage_intensity) * pred +
+                self.shrinkage_intensity * grand_mean
+            )
+
+        return shrunk
 
     def allocate(
         self,
@@ -145,66 +424,72 @@ class MeanVarianceStrategy(BaseStrategy):
         **kwargs
     ) -> Dict[str, float]:
         """
-        Compute optimal portfolio weights using mean-variance optimization.
+        Compute portfolio weights using predicted returns.
 
         Args:
-            prices: Historical price data
-            current_date: Date for which to compute allocation (uses data up to this date)
+            prices: Historical price data (up to but not including current_date)
+            current_date: Date for which to compute allocation
             **kwargs: Additional parameters
 
         Returns:
-            Dictionary of optimal weights
+            Dictionary mapping ticker to portfolio weight
         """
-        # Use only data up to current_date for strict no-look-ahead
+        # Use only data up to current_date
         if current_date is not None:
-            prices = prices[:current_date]
+            prices = prices.loc[:current_date]
 
         # Use last lookback_days of history
         if len(prices) > self.lookback_days:
             prices = prices.iloc[-self.lookback_days:]
 
-        # Need at least 30 days for reasonable estimation
-        if len(prices) < 30:
-            # Fall back to equal weight if insufficient data
+        # Require minimum history
+        if len(prices) < self.min_history_days:
             print(f"Warning: Insufficient data ({len(prices)} days), using equal weights")
             return EqualWeightStrategy().allocate(prices)
 
         try:
-            # Compute expected returns using historical mean
-            mu = expected_returns.mean_historical_return(prices, frequency=252)
+            # Step 1: Predict expected returns using Ridge regression
+            predicted_returns = self._train_models(prices)
 
-            # Compute sample covariance matrix
-            S = risk_models.sample_cov(prices, frequency=252)
+            # Step 2: Apply shrinkage to predictions
+            shrunk_returns = self._apply_shrinkage(predicted_returns)
 
-            # Set up efficient frontier
-            ef = EfficientFrontier(mu, S, weight_bounds=(0, 1))  # Long-only
+            # Convert to pandas Series for PyPortfolioOpt
+            mu = pd.Series(shrunk_returns)
 
-            # Optimize based on method
-            if self.method == "max_sharpe":
-                weights = ef.max_sharpe(risk_free_rate=self.risk_free_rate)
-            elif self.method == "min_volatility":
-                weights = ef.min_volatility()
-            elif self.method == "efficient_risk":
-                target_volatility = kwargs.get("target_volatility", 0.15)
-                weights = ef.efficient_risk(target_volatility)
-            else:
-                raise ValueError(f"Unknown method: {self.method}")
+            # Step 3: Estimate covariance using Ledoit-Wolf shrinkage
+            returns_df = prices.pct_change().dropna()
+            lw = LedoitWolf().fit(returns_df.values)
 
-            # Clean weights (remove tiny values)
+            # Convert to annualized covariance matrix
+            cov_matrix = pd.DataFrame(
+                lw.covariance_ * 252,
+                index=prices.columns,
+                columns=prices.columns
+            )
+
+            # Step 4: Optimize using PyPortfolioOpt
+            ef = EfficientFrontier(mu, cov_matrix, weight_bounds=(0, self.max_weight))
+
+            # Add L2 regularization
+            if self.l2_gamma > 0:
+                ef.add_objective(objective_functions.L2_reg, gamma=self.l2_gamma)
+
+            # Maximize Sharpe ratio
+            ef.max_sharpe(risk_free_rate=self.risk_free_rate)
+
+            # Get cleaned weights
             weights = ef.clean_weights()
 
-            # Ensure all tickers are present (PyPortfolioOpt may drop some)
+            # Ensure all tickers present
             for ticker in prices.columns:
-                if ticker not in weights:
-                    weights[ticker] = 0.0
+                weights.setdefault(ticker, 0.0)
 
             self.validate_weights(weights)
-
             return weights
 
         except Exception as e:
-            # If optimization fails, fall back to equal weight
-            print(f"Warning: Optimization failed ({str(e)}), using equal weights")
+            print(f"Warning: Predictive optimization failed ({str(e)}), using equal weights")
             return EqualWeightStrategy().allocate(prices)
 
 
