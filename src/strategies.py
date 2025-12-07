@@ -1,7 +1,7 @@
 """
 Portfolio allocation strategies.
 
-Implements baseline strategies including equal weight and mean-variance optimization.
+Implementst baseline strategies including equal weight and mean-variance optimization.
 """
 
 from abc import ABC, abstractmethod
@@ -13,6 +13,11 @@ from pypfopt.efficient_frontier import EfficientFrontier
 from sklearn.linear_model import Ridge
 from sklearn.covariance import LedoitWolf
 from sklearn.model_selection import TimeSeriesSplit
+import torch
+import numpy as np
+import pandas as pd
+from torch.utils.data import TensorDataset, DataLoader
+from lstm_model import LSTMReturnPredictor 
 
 
 class BaseStrategy(ABC):
@@ -609,7 +614,102 @@ def create_60_40_strategy(stock_tickers: list, bond_tickers: list) -> StaticStra
 
     return StaticStrategy(weights)
 
+class RiskAdjustedLSTMStrategy(BaseStrategy):
+    def __init__(self,lookback=30,hidden_dim=32,epochs=20,lr=1e-3):
+        super().__init__("Risk Adjusted LSTM")
+        self.lookback=lookback
+        self.hidden_dim=hidden_dim
+        self.epochs=epochs
+        self.lr=lr
+        self.models: Dict[str,torch.nn.Module]={} #this is to ensure one lstm for each ticker
+        
+    def _prepare_data(self,series):
+        data=series.pct_change().dropna().values.astype(np.float32)
+        data = (data - data.mean()) / (data.std() + 1e-6)
+        X,Y=[],[]
+        for i in range(len(data)-self.lookback-1):
+            X.append(data[i:i+self.lookback])
+            Y.append(data[i+self.lookback]) #this is for next day returns
+        if len(X)==0:
+            return torch.empty(0), torch.empty(0)
 
+        X = torch.tensor(np.array(X), dtype=torch.float32).unsqueeze(-1)
+        Y = torch.tensor(np.array(Y), dtype=torch.float32).unsqueeze(-1)
+
+        return X,Y
+    def _train_model(self,series):
+        self.series=pd.Series
+        X,Y=self._prepare_data(series)
+        if len(X)<10:
+            model=LSTMReturnPredictor(input_dim=1,hidden_dim=self.hidden_dim) #if there isn't enough data
+            return model
+        model=LSTMReturnPredictor(input_dim=1,hidden_dim=self.hidden_dim)
+        optimizer=torch.optim.Adam(model.parameters(),lr=self.lr)
+        loss_fn=torch.nn.MSELoss()
+        ds=TensorDataset(X,Y)
+        dl=DataLoader(ds,batch_size=32,shuffle=True)
+        for i in range(self.epochs):
+            for x_batch,y_batch in dl:
+                optimizer.zero_grad()
+                pred=model(x_batch)
+                loss=loss_fn(pred,y_batch)
+                loss.backward()
+                optimizer.step()
+        return model
+    def _predict_next_return(self,model,series:pd.Series):
+        data=series.pct_change().dropna().values.astype(np.float32)
+        if len(data)<self.lookback:
+            return 0.0
+        
+        window=torch.tensor(data[-self.lookback:]).unsqueeze(0).unsqueeze(-1)
+        return float(model(window).item())
+    def _calculate_recent_volatility(self,series:pd.Series,window=20):
+        returns=series.pct_change().dropna()
+        if len(returns)<window:
+            return returns.std() if len(returns) > 0 else 1e-6
+        return returns.tail(window).std()
+    
+    def allocate(self,prices,current_date=None,**kwargs):
+        if current_date is not None:
+            price=prices.loc[:current_date]
+        else:
+            price = prices
+        tickers=list(prices.columns)
+        if not self.models:
+            for ticker in tickers:
+                self.models[ticker]=self._train_model(prices[ticker])
+        
+        pred_returns={}
+        vol={}
+        for ticker in tickers:
+            series=price[ticker]
+            model=self.models[ticker]
+            prediction=self._predict_next_return(model,series)
+            volatility=self._calculate_recent_volatility(series)
+            pred_returns[ticker]=prediction
+            vol[ticker]=max(volatility,1e-6)
+            
+        scores={}
+        #print("\nPredicted next-day returns:")
+        #for t, r in pred_returns.items():
+            #print(t, r)
+
+        for ticker in tickers:
+            stock_return = pred_returns[ticker]
+            scores[ticker]=stock_return/vol[ticker]
+            
+        score_values=np.array(list(scores.values()))
+        
+        if score_values.sum()<=0:
+            weights={t:1/len(tickers)for t in tickers}
+        else:
+            exp_scores = np.exp(score_values - np.max(score_values))
+            softmax_scores = exp_scores / exp_scores.sum()
+            weights = {t: softmax_scores[i] for i, t in enumerate(tickers)}
+
+        self.validate_weights(weights)
+        return weights
+        
 if __name__ == "__main__":
     # Example usage
     from data import load_default_etfs, ETFDataLoader

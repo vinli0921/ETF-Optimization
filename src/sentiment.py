@@ -3,14 +3,15 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
 import pandas as pd
 import datetime
+import feedparser
 
-ETF_HOLDINGS={
-    "SPY": ["AAPL", "MSFT", "AMZN", "NVDA", "GOOGL"],
-    "QQQ": ["AAPL", "MSFT", "NVDA", "AMZN", "META"],
-    "VTI": ["AAPL", "MSFT", "AMZN", "NVDA", "GOOGL"],
-    "TLT": ["TLT"],  # Treasuries → use ETF news directly
-    "BND": ["BND"],  # Bond news
-    "GLD": ["GLD"]   # Gold news
+ETF_HOLDINGS={"SPY": ["AAPL", "MSFT", "NVDA", "AMZN", "META"],
+        "QQQ": ["MSFT", "NVDA", "AMZN", "META", "AVGO"],
+        "VTI": ["AAPL", "MSFT", "AMZN", "NVDA", "GOOGL"],
+    # Macro ETFs use mascro sources
+        "TLT": ["TLT", "^TNX", "^TYX"],
+        "BND": ["BND", "IEF", "^TNX"],
+        "GLD": ["GLD", "GC=F", "GDX"],
 }
 class FinBertSentiment:
     def __init__(self):
@@ -34,30 +35,18 @@ class FinBertSentiment:
         return float(probs[2] - probs[0])
 
 def get_recent_news(ticker):
-    tk=yf.Ticker(ticker)
-    raw_news=tk.news or []
-
-    if len(raw_news)==0:
-        return []
+    url=f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}"
+    feed=feedparser.parse(url)
 
     rows=[]
-
-    for item in raw_news:
-        content=item.get("content", {})
-        title=content.get("title", "") or ""
-        summary=content.get("summary", "") or ""
-        text = (title + ". " + summary).strip()
+    for entry in feed.entries:
+        title=entry.get("title", "")
+        summary=entry.get("summary", "")
+        text=(title + ". " + summary).strip()
         if not text:
             continue
-
-        # Job to extract the timestamp
-        ts=item.get("providerPublishTime")
-
-        # Try pubDate if "providerPublishTime" doesn't work
-        if ts is None:
-            ts=item.get("pubDate")
-
-        # Last fallback → treat as now
+        # Job to extract the timestamp'''
+        ts=entry.get("pubDate")
         if ts is None:
             dt=datetime.datetime.now().date()
             rows.append((dt, text))
@@ -103,14 +92,53 @@ def compute_etf_sentiment(etf, finbert):
     df=pd.DataFrame(results, columns=["date", "sentiment"])
     df=df.groupby("date")["sentiment"].mean().sort_index()
 
+
     return df
+
+def compute_all_etf_sentiment(etfs):
+    if etfs is None:
+        etfs=["SPY", "QQQ", "VTI", "TLT", "BND", "GLD"]
+    finbert=FinBertSentiment()
+    all_sent=[]
+
+    for etf in etfs:
+        s=compute_etf_sentiment(etf, finbert)
+        s.name=f"{etf}_sentiment"
+        all_sent.append(s)
+
+    final_df=pd.concat(all_sent, axis=1).fillna(0)
+    final_df.index=pd.to_datetime(final_df.index)
+    cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=9)
+    final_df = final_df[final_df.index >= cutoff]
+    return final_df
+
 
 if __name__ == "__main__":
     ETFs=["SPY", "QQQ", "VTI", "TLT", "BND", "GLD"]
 
-    finbert=FinBertSentiment()
+    final_df = compute_all_etf_sentiment(ETFs)
+    print("\nLast 10 days of ETF Sentiment DataFrame:")
+    print(final_df)
+    print("\nDone.")
+    
+    ETFs=["SPY", "QQQ", "VTI", "TLT", "BND", "GLD"]
 
-    all_sent=pd.DataFrame()
+    finbert=FinBertSentiment()
+    # Collect each ETF's sentiment series
+    all_sent=[]
+
+    for etf in ETFs:
+        s=compute_etf_sentiment(etf,finbert)
+        s.name=f"{etf}_sentiment"
+        all_sent.append(s)
+    # Proper alignment across dates
+    final_df=pd.concat(all_sent, axis=1).fillna(0)
+    print("\nFinal ETF Sentiment DataFrame:")
+    print(final_df.tail())
+    print("\nDone.")
+    
+    
+    '''all_sent=pd.DataFrame()
 
     for etf in ETFs:
         s = compute_etf_sentiment(etf, finbert)
@@ -123,7 +151,7 @@ if __name__ == "__main__":
 
     print("\nFinal ETF Sentiment DataFrame:")
     print(all_sent.tail())
-    print("\nDone.")
+    print("\nDone.")'''
 
 ''''class FinBertSentiment:
     def __init__(self):
