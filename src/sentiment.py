@@ -19,26 +19,27 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 # Mapping from ETF tickers to search keywords for GDELT
+# Note: Avoid special characters like & which break GDELT queries
 ETF_KEYWORDS = {
     # US Equity ETFs
-    "SPY": ["S&P 500", "SP500", "stock market", "Wall Street"],
-    "QQQ": ["NASDAQ", "tech stocks", "technology sector", "QQQ"],
+    "SPY": ["SP500", "stock market", "Wall Street", "stocks rally"],
+    "QQQ": ["NASDAQ", "tech stocks", "technology sector"],
     "VTI": ["stock market", "US equities", "equity market"],
     "IWM": ["small cap stocks", "Russell 2000", "small cap"],
 
     # Bond ETFs
-    "TLT": ["treasury bonds", "interest rates", "Fed rates", "long term bonds"],
-    "BND": ["bond market", "fixed income", "bonds"],
+    "TLT": ["treasury bonds", "interest rates", "Federal Reserve", "long term bonds"],
+    "BND": ["bond market", "fixed income", "treasury yields"],
 
     # Commodity ETFs
-    "GLD": ["gold price", "gold market", "precious metals", "gold ETF"],
+    "GLD": ["gold price", "gold market", "precious metals"],
 
     # International ETFs
-    "VEA": ["international stocks", "developed markets", "European stocks", "Japan stocks"],
-    "VWO": ["emerging markets", "EM stocks", "developing markets", "emerging market"],
+    "VEA": ["international stocks", "developed markets", "European stocks"],
+    "VWO": ["emerging markets", "developing markets", "China stocks"],
 
     # Sector ETFs
-    "XLE": ["energy sector", "oil stocks", "oil price", "energy stocks"],
+    "XLE": ["energy sector", "oil stocks", "oil price", "crude oil"],
 }
 
 # Holdings for fallback to individual stock news
@@ -213,9 +214,20 @@ class GDELTNewsLoader:
             return pd.DataFrame(columns=["date", "title", "url"])
 
         try:
+            # Clean keywords - remove special characters that break GDELT queries
+            clean_keywords = []
+            for kw in keywords:
+                # Remove problematic characters
+                clean_kw = kw.replace("&", "and").replace("/", " ")
+                clean_keywords.append(clean_kw)
+
+            # Join keywords into a single query string with OR
+            # gdeltdoc expects a single string for keyword parameter
+            keyword_query = " OR ".join(f'"{kw}"' for kw in clean_keywords)
+
             # GDELT queries one date range at a time
             f = self.Filters(
-                keyword=keywords,
+                keyword=keyword_query,
                 start_date=start_date,
                 end_date=end_date,
                 num_records=max_records,
@@ -487,7 +499,7 @@ if __name__ == "__main__":
         start = end - timedelta(days=7)
 
         news = gdelt.fetch_news(
-            keywords=["stock market", "S&P 500"],
+            keywords=["stock market", "Wall Street"],
             start_date=start.strftime("%Y-%m-%d"),
             end_date=end.strftime("%Y-%m-%d"),
             max_records=10
