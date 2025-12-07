@@ -157,12 +157,13 @@ class ETFDataLoader:
 def load_default_etfs(
     start_date: str = "2015-01-01",
     end_date: Optional[str] = None,
-    cache_dir: str = "data"
+    cache_dir: str = "data",
+    expanded: bool = True
 ) -> pd.DataFrame:
     """
     Convenience function to load default ETF set.
 
-    ETFs included:
+    Core ETFs (always included):
     - SPY: S&P 500 (US large-cap stocks)
     - QQQ: NASDAQ-100 (US tech stocks)
     - VTI: Vanguard Total Stock Market (broad US stocks)
@@ -170,10 +171,17 @@ def load_default_etfs(
     - BND: Vanguard Total Bond Market (broad US bonds)
     - GLD: SPDR Gold Trust (gold)
 
+    Expanded ETFs (when expanded=True):
+    - VEA: Vanguard FTSE Developed Markets (international developed)
+    - VWO: Vanguard FTSE Emerging Markets (emerging markets)
+    - IWM: iShares Russell 2000 (US small-cap)
+    - XLE: Energy Select Sector SPDR (energy sector)
+
     Args:
         start_date: Start date (YYYY-MM-DD)
         end_date: End date (YYYY-MM-DD), defaults to today
         cache_dir: Cache directory
+        expanded: If True, include additional diversifying ETFs (10 total)
 
     Returns:
         DataFrame with price data
@@ -182,7 +190,13 @@ def load_default_etfs(
         end_date = datetime.today().strftime('%Y-%m-%d')
 
     loader = ETFDataLoader(cache_dir=cache_dir)
+
+    # Core ETFs
     tickers = ['SPY', 'QQQ', 'VTI', 'TLT', 'BND', 'GLD']
+
+    # Add diversifying ETFs for expanded universe
+    if expanded:
+        tickers.extend(['VEA', 'VWO', 'IWM', 'XLE'])
 
     prices = loader.download_etfs(tickers, start_date, end_date)
 

@@ -1,245 +1,502 @@
-import yfinance as yf
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import torch
-import pandas as pd
-import datetime
-import feedparser
+"""
+Sentiment analysis for ETF portfolio optimization.
 
-ETF_HOLDINGS={"SPY": ["AAPL", "MSFT", "NVDA", "AMZN", "META"],
-        "QQQ": ["MSFT", "NVDA", "AMZN", "META", "AVGO"],
-        "VTI": ["AAPL", "MSFT", "AMZN", "NVDA", "GOOGL"],
-    # Macro ETFs use mascro sources
-        "TLT": ["TLT", "^TNX", "^TYX"],
-        "BND": ["BND", "IEF", "^TNX"],
-        "GLD": ["GLD", "GC=F", "GDX"],
+Uses GDELT for historical news and FinBERT for sentiment scoring.
+Supports caching to avoid repeated API calls during backtesting.
+"""
+
+import os
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+
+# Mapping from ETF tickers to search keywords for GDELT
+ETF_KEYWORDS = {
+    # US Equity ETFs
+    "SPY": ["S&P 500", "SP500", "stock market", "Wall Street"],
+    "QQQ": ["NASDAQ", "tech stocks", "technology sector", "QQQ"],
+    "VTI": ["stock market", "US equities", "equity market"],
+    "IWM": ["small cap stocks", "Russell 2000", "small cap"],
+
+    # Bond ETFs
+    "TLT": ["treasury bonds", "interest rates", "Fed rates", "long term bonds"],
+    "BND": ["bond market", "fixed income", "bonds"],
+
+    # Commodity ETFs
+    "GLD": ["gold price", "gold market", "precious metals", "gold ETF"],
+
+    # International ETFs
+    "VEA": ["international stocks", "developed markets", "European stocks", "Japan stocks"],
+    "VWO": ["emerging markets", "EM stocks", "developing markets", "emerging market"],
+
+    # Sector ETFs
+    "XLE": ["energy sector", "oil stocks", "oil price", "energy stocks"],
 }
+
+# Holdings for fallback to individual stock news
+ETF_HOLDINGS = {
+    "SPY": ["AAPL", "MSFT", "NVDA", "AMZN", "META"],
+    "QQQ": ["MSFT", "NVDA", "AMZN", "META", "AVGO"],
+    "VTI": ["AAPL", "MSFT", "AMZN", "NVDA", "GOOGL"],
+    "TLT": ["TLT"],
+    "BND": ["BND"],
+    "GLD": ["GLD"],
+    "VEA": ["VEA"],
+    "VWO": ["VWO"],
+    "IWM": ["IWM"],
+    "XLE": ["XOM", "CVX"],
+}
+
+
 class FinBertSentiment:
-    def __init__(self):
-        self.tokenizer=AutoTokenizer.from_pretrained("ProsusAI/finbert")
-        self.model=AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+    """
+    FinBERT-based sentiment scorer for financial text.
+
+    Returns sentiment scores in range [-1, 1] where:
+    - Positive values indicate bullish/positive sentiment
+    - Negative values indicate bearish/negative sentiment
+    - Zero indicates neutral sentiment
+    """
+
+    def __init__(self, device: str = None):
+        """
+        Initialize FinBERT model.
+
+        Args:
+            device: 'cuda', 'mps', or 'cpu'. Auto-detected if None.
+        """
+        if device is None:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+
+        self.device = device
+        print(f"Loading FinBERT model on {device}...")
+
+        self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+        self.model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+        self.model.to(self.device)
         self.model.eval()
 
-    def score(self, text):
-        if not text or text.strip()=="":
+    def score(self, text: str) -> float:
+        """
+        Score a single text for sentiment.
+
+        Args:
+            text: Text to analyze
+
+        Returns:
+            Sentiment score in [-1, 1]
+        """
+        if not text or text.strip() == "":
             return 0.0
 
-        tokens=self.tokenizer(text, return_tensors="pt", truncation=True)
+        # Truncate very long texts
+        text = text[:512]
+
+        tokens = self.tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+            padding=True
+        )
+        tokens = {k: v.to(self.device) for k, v in tokens.items()}
 
         with torch.no_grad():
-            logits=self.model(
-                input_ids=tokens["input_ids"],
-                attention_mask=tokens["attention_mask"]
-            ).logits
+            logits = self.model(**tokens).logits
 
-        probs=torch.softmax(logits, dim=1).numpy()[0]
+        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+        # FinBERT outputs: [negative, neutral, positive]
+        # Return P(positive) - P(negative)
         return float(probs[2] - probs[0])
 
-def get_recent_news(ticker):
-    url=f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}"
-    feed=feedparser.parse(url)
+    def score_batch(self, texts: List[str], batch_size: int = 16) -> List[float]:
+        """
+        Score multiple texts efficiently in batches.
 
-    rows=[]
-    for entry in feed.entries:
-        title=entry.get("title", "")
-        summary=entry.get("summary", "")
-        text=(title + ". " + summary).strip()
-        if not text:
-            continue
-        # Job to extract the timestamp'''
-        ts=entry.get("pubDate")
-        if ts is None:
-            dt=datetime.datetime.now().date()
-            rows.append((dt, text))
-            continue
+        Args:
+            texts: List of texts to analyze
+            batch_size: Batch size for processing
 
-        # Try UNIX timestamp
+        Returns:
+            List of sentiment scores
+        """
+        scores = []
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            batch = [t[:512] if t else "" for t in batch]
+
+            tokens = self.tokenizer(
+                batch,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+                padding=True
+            )
+            tokens = {k: v.to(self.device) for k, v in tokens.items()}
+
+            with torch.no_grad():
+                logits = self.model(**tokens).logits
+
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            batch_scores = probs[:, 2] - probs[:, 0]
+            scores.extend(batch_scores.tolist())
+
+        return scores
+
+
+class GDELTNewsLoader:
+    """
+    Fetches historical news from GDELT Project.
+
+    GDELT provides free access to global news data dating back to 2015+.
+    Uses the gdeltdoc library to query the GDELT DOC 2.0 API.
+    """
+
+    def __init__(self, cache_dir: str = "data"):
+        """
+        Initialize GDELT loader.
+
+        Args:
+            cache_dir: Directory for caching news data
+        """
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+
+        # Try to import gdeltdoc
         try:
-            dt=pd.to_datetime(ts, unit="s")
-        except:
-            # Try normal timestamp
-            try:
-                dt=pd.to_datetime(ts)
-            except:
-                dt=datetime.datetime.now()
+            from gdeltdoc import GdeltDoc, Filters
+            self.gdelt = GdeltDoc()
+            self.Filters = Filters
+            self._available = True
+        except ImportError:
+            print("Warning: gdeltdoc not installed. Run: pip install gdeltdoc")
+            self._available = False
 
-        rows.append((dt.date(), text))
+    def is_available(self) -> bool:
+        """Check if GDELT is available."""
+        return self._available
 
-    return rows
+    def fetch_news(
+        self,
+        keywords: List[str],
+        start_date: str,
+        end_date: str,
+        max_records: int = 250
+    ) -> pd.DataFrame:
+        """
+        Fetch news articles from GDELT for given keywords and date range.
+
+        Args:
+            keywords: List of search keywords
+            start_date: Start date (YYYY-MM-DD)
+            end_date: End date (YYYY-MM-DD)
+            max_records: Maximum number of records to fetch
+
+        Returns:
+            DataFrame with columns: date, title, url
+        """
+        if not self._available:
+            return pd.DataFrame(columns=["date", "title", "url"])
+
+        try:
+            # GDELT queries one date range at a time
+            f = self.Filters(
+                keyword=keywords,
+                start_date=start_date,
+                end_date=end_date,
+                num_records=max_records,
+                country="US"  # Focus on US news for ETFs
+            )
+
+            articles = self.gdelt.article_search(f)
+
+            if articles.empty:
+                return pd.DataFrame(columns=["date", "title", "url"])
+
+            # Process results
+            result = pd.DataFrame({
+                "date": pd.to_datetime(articles["seendate"]).dt.date,
+                "title": articles["title"],
+                "url": articles["url"]
+            })
+
+            return result
+
+        except Exception as e:
+            print(f"GDELT query failed: {e}")
+            return pd.DataFrame(columns=["date", "title", "url"])
+
+    def fetch_news_for_etf(
+        self,
+        etf: str,
+        start_date: str,
+        end_date: str,
+        max_records_per_month: int = 100
+    ) -> pd.DataFrame:
+        """
+        Fetch news for an ETF by querying its associated keywords.
+
+        Handles large date ranges by batching queries by month.
+
+        Args:
+            etf: ETF ticker symbol
+            start_date: Start date (YYYY-MM-DD)
+            end_date: End date (YYYY-MM-DD)
+            max_records_per_month: Max records per monthly query
+
+        Returns:
+            DataFrame with news data
+        """
+        keywords = ETF_KEYWORDS.get(etf, [etf])
+
+        if not keywords:
+            return pd.DataFrame(columns=["date", "title", "url"])
+
+        # Break into monthly chunks to avoid API limits
+        start = pd.to_datetime(start_date)
+        end = pd.to_datetime(end_date)
+
+        all_news = []
+        current = start
+
+        while current < end:
+            # Get end of current month
+            month_end = min(current + pd.DateOffset(months=1) - pd.DateOffset(days=1), end)
+
+            news = self.fetch_news(
+                keywords=keywords,
+                start_date=current.strftime("%Y-%m-%d"),
+                end_date=month_end.strftime("%Y-%m-%d"),
+                max_records=max_records_per_month
+            )
+
+            if not news.empty:
+                news["etf"] = etf
+                all_news.append(news)
+
+            current = month_end + pd.DateOffset(days=1)
+
+        if not all_news:
+            return pd.DataFrame(columns=["date", "title", "url", "etf"])
+
+        return pd.concat(all_news, ignore_index=True)
 
 
-def compute_etf_sentiment(etf, finbert):
-    holdings=ETF_HOLDINGS.get(etf, [])
-    results=[]
+class SentimentCache:
+    """
+    Caches sentiment scores to avoid recomputation during backtesting.
+    """
 
-    print(f"\n Computing sentiment for ETF {etf} using holdings {holdings}")
+    def __init__(self, cache_dir: str = "data"):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+        self.cache_file = self.cache_dir / "sentiment_cache.csv"
 
-    for h in holdings:
-        print(f"   → Fetching news for {h}...")
-        news_items=get_recent_news(h)
+    def load(self) -> Optional[pd.DataFrame]:
+        """Load cached sentiment data."""
+        if self.cache_file.exists():
+            df = pd.read_csv(self.cache_file, index_col=0, parse_dates=True)
+            print(f"Loaded cached sentiment data: {len(df)} days")
+            return df
+        return None
 
-        if len(news_items)==0:
-            print(f"No news for {h}. Skipping.")
+    def save(self, df: pd.DataFrame):
+        """Save sentiment data to cache."""
+        df.to_csv(self.cache_file)
+        print(f"Saved sentiment cache to {self.cache_file}")
+
+    def is_cached(self) -> bool:
+        """Check if cache exists."""
+        return self.cache_file.exists()
+
+
+def compute_historical_sentiment(
+    start_date: str,
+    end_date: str,
+    tickers: List[str] = None,
+    cache_dir: str = "data",
+    force_refresh: bool = False
+) -> pd.DataFrame:
+    """
+    Compute historical sentiment for ETFs using GDELT + FinBERT.
+
+    Args:
+        start_date: Start date (YYYY-MM-DD)
+        end_date: End date (YYYY-MM-DD)
+        tickers: List of ETF tickers (uses all if None)
+        cache_dir: Cache directory
+        force_refresh: If True, recompute even if cached
+
+    Returns:
+        DataFrame with columns: {ticker}_sentiment for each ticker
+        Index is DatetimeIndex with trading days
+    """
+    if tickers is None:
+        tickers = list(ETF_KEYWORDS.keys())
+
+    cache = SentimentCache(cache_dir)
+
+    # Try to load from cache
+    if not force_refresh and cache.is_cached():
+        cached = cache.load()
+        if cached is not None:
+            # Check if we have all required tickers
+            required_cols = [f"{t}_sentiment" for t in tickers]
+            if all(col in cached.columns for col in required_cols):
+                # Filter to date range
+                cached = cached.loc[start_date:end_date]
+                if len(cached) > 0:
+                    return cached[required_cols]
+
+    print(f"Computing historical sentiment from {start_date} to {end_date}...")
+    print(f"ETFs: {tickers}")
+    print("This may take a while for large date ranges...")
+
+    # Initialize components
+    gdelt = GDELTNewsLoader(cache_dir)
+    finbert = FinBertSentiment()
+
+    if not gdelt.is_available():
+        print("GDELT not available. Returning zeros.")
+        # Create date range
+        dates = pd.date_range(start=start_date, end=end_date, freq="B")
+        df = pd.DataFrame(index=dates)
+        for ticker in tickers:
+            df[f"{ticker}_sentiment"] = 0.0
+        return df
+
+    all_sentiment = {}
+
+    for ticker in tickers:
+        print(f"\nProcessing {ticker}...")
+
+        # Fetch news
+        news = gdelt.fetch_news_for_etf(
+            etf=ticker,
+            start_date=start_date,
+            end_date=end_date
+        )
+
+        if news.empty:
+            print(f"  No news found for {ticker}")
+            all_sentiment[f"{ticker}_sentiment"] = pd.Series(dtype=float)
             continue
 
-        for date, text in news_items:
-            score=finbert.score(text)
-            results.append((date, score))
+        print(f"  Found {len(news)} articles, scoring with FinBERT...")
 
-    if len(results)==0:
-        print(f"No sentiment data found for {etf}. Returning zeros.")
-        return pd.Series(dtype=float)
+        # Score all titles
+        titles = news["title"].fillna("").tolist()
+        scores = finbert.score_batch(titles)
+        news["sentiment"] = scores
 
-    df=pd.DataFrame(results, columns=["date", "sentiment"])
-    df=df.groupby("date")["sentiment"].mean().sort_index()
+        # Aggregate by date
+        daily_sentiment = news.groupby("date")["sentiment"].mean()
+        daily_sentiment.index = pd.to_datetime(daily_sentiment.index)
 
+        all_sentiment[f"{ticker}_sentiment"] = daily_sentiment
+        print(f"  Got sentiment for {len(daily_sentiment)} days")
+
+    # Combine into DataFrame
+    df = pd.DataFrame(all_sentiment)
+
+    # Create full business day index and forward-fill gaps
+    full_index = pd.date_range(start=start_date, end=end_date, freq="B")
+    df = df.reindex(full_index)
+    df = df.fillna(method="ffill").fillna(0)
+
+    # Save to cache
+    cache.save(df)
 
     return df
 
-def compute_all_etf_sentiment(etfs):
-    if etfs is None:
-        etfs=["SPY", "QQQ", "VTI", "TLT", "BND", "GLD"]
-    finbert=FinBertSentiment()
-    all_sent=[]
 
-    for etf in etfs:
-        s=compute_etf_sentiment(etf, finbert)
-        s.name=f"{etf}_sentiment"
-        all_sent.append(s)
+def compute_sentiment_features(
+    sentiment_df: pd.DataFrame,
+    ma_window: int = 5
+) -> pd.DataFrame:
+    """
+    Compute additional sentiment features from raw sentiment.
 
-    final_df=pd.concat(all_sent, axis=1).fillna(0)
-    final_df.index=pd.to_datetime(final_df.index)
-    cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=9)
-    final_df = final_df[final_df.index >= cutoff]
-    return final_df
+    Args:
+        sentiment_df: DataFrame with {ticker}_sentiment columns
+        ma_window: Window for moving average
+
+    Returns:
+        DataFrame with additional features:
+        - {ticker}_sentiment_ma{window}: Moving average
+        - {ticker}_sentiment_momentum: Change in sentiment
+    """
+    features = sentiment_df.copy()
+
+    for col in sentiment_df.columns:
+        if col.endswith("_sentiment"):
+            base = col.replace("_sentiment", "")
+
+            # Moving average
+            features[f"{base}_sentiment_ma{ma_window}"] = (
+                sentiment_df[col].rolling(window=ma_window, min_periods=1).mean()
+            )
+
+            # Momentum (change over ma_window days)
+            features[f"{base}_sentiment_momentum"] = (
+                sentiment_df[col] - sentiment_df[col].shift(ma_window)
+            ).fillna(0)
+
+    return features
 
 
 if __name__ == "__main__":
-    ETFs=["SPY", "QQQ", "VTI", "TLT", "BND", "GLD"]
+    # Test the sentiment pipeline
+    print("Testing sentiment pipeline...")
 
-    final_df = compute_all_etf_sentiment(ETFs)
-    print("\nLast 10 days of ETF Sentiment DataFrame:")
-    print(final_df)
+    # Test FinBERT
+    finbert = FinBertSentiment()
+
+    test_texts = [
+        "Stock market rallies to new highs on strong earnings",
+        "Market crashes amid recession fears",
+        "Federal Reserve holds interest rates steady",
+    ]
+
+    print("\nFinBERT test:")
+    for text in test_texts:
+        score = finbert.score(text)
+        print(f"  Score: {score:+.3f} | {text[:50]}...")
+
+    # Test GDELT (if available)
+    print("\nTesting GDELT...")
+    gdelt = GDELTNewsLoader()
+
+    if gdelt.is_available():
+        # Test with recent date range
+        end = datetime.today()
+        start = end - timedelta(days=7)
+
+        news = gdelt.fetch_news(
+            keywords=["stock market", "S&P 500"],
+            start_date=start.strftime("%Y-%m-%d"),
+            end_date=end.strftime("%Y-%m-%d"),
+            max_records=10
+        )
+
+        print(f"  Found {len(news)} articles")
+        if not news.empty:
+            print(news.head())
+    else:
+        print("  GDELT not available (install gdeltdoc)")
+
     print("\nDone.")
-    
-    ETFs=["SPY", "QQQ", "VTI", "TLT", "BND", "GLD"]
-
-    finbert=FinBertSentiment()
-    # Collect each ETF's sentiment series
-    all_sent=[]
-
-    for etf in ETFs:
-        s=compute_etf_sentiment(etf,finbert)
-        s.name=f"{etf}_sentiment"
-        all_sent.append(s)
-    # Proper alignment across dates
-    final_df=pd.concat(all_sent, axis=1).fillna(0)
-    print("\nFinal ETF Sentiment DataFrame:")
-    print(final_df.tail())
-    print("\nDone.")
-    
-    
-    '''all_sent=pd.DataFrame()
-
-    for etf in ETFs:
-        s = compute_etf_sentiment(etf, finbert)
-
-        if s.empty:
-            # Create placeholder so DataFrame aligns
-            all_sent[f"{etf}_sentiment"] = 0
-        else:
-            all_sent[f"{etf}_sentiment"] = s
-
-    print("\nFinal ETF Sentiment DataFrame:")
-    print(all_sent.tail())
-    print("\nDone.")'''
-
-''''class FinBertSentiment:
-    def __init__(self):
-        self.tokenizer=AutoTokenizer.from_pretrained("ProsusAI/finbert")
-        self.model=AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
-        self.model.eval()
-        
-    def score(self,text):
-        tokenized_inputs=self.tokenizer(text,return_tensors="pt",truncation=True)
-        with torch.no_grad():
-            logits = self.model(input_ids=tokenized_inputs["input_ids"],attention_mask=tokenized_inputs["attention_mask"]).logits
-            
-        tensor_probability=torch.softmax(logits,dim=1)
-        numpy_probs=tensor_probability.detach().numpy()
-        probabilities=numpy_probs[0]
-        return float(probabilities[2]-probabilities[0])
-    
-    def daily_sentiment(self, ticker, start, end):
-        tk=yf.Ticker(ticker)
-        news=tk.news or []
-
-        start_dt=pd.to_datetime(start).date()
-        end_dt=pd.to_datetime(end).date()
-        rows=[]
-        for item in news:
-            raw_dt=(item.get("providerPublishTime") or item.get("pubDate") or item.get("displayTime"))
-
-            if raw_dt is None:
-                continue
-            try:
-                dt=pd.to_datetime(raw_dt)
-            except:
-                continue
-            d=dt.date()
-            if not (start_dt <= d <= end_dt):
-                continue
-            title=item.get("title","")
-            summary=item.get("summary","")
-            text=(title+" "+summary).strip()
-            if not text:
-                continue
-
-            score=self.score(text)
-            rows.append((d, score))
-
-    # Return empty series if no data
-        if not rows:
-            return pd.Series(dtype=float)
-
-        df=pd.DataFrame(rows, columns=["date", "sentiment"])
-        return df.groupby("date")["sentiment"].mean()
-    
-    
-
-def generate_etf_sentiment_features(etf_prices):
-    """
-    Produces a sentiment feature for each ETF using its proxy ticker.
-    Returns a DataFrame with columns:
-        VTI_sentiment, SPY_sentiment, QQQ_sentiment, BND_sentiment, TLT_sentiment, GLD_sentiment
-    """
-    finbert=FinBertSentiment()
-    sentiment_df=pd.DataFrame(index=etf_prices.index)
-
-    start=str(etf_prices.index[0].date())
-    end=str(etf_prices.index[-1].date())
-
-    for etf in etf_prices.columns:
-        proxy=ETF_SENTIMENT_PROXIES.get(etf, "AAPL")
-
-        series=finbert.daily_sentiment(proxy, start, end)
-
-        if series.empty:
-            print(f"  No news for proxy {proxy}. Filling with zeros.\n")
-            sentiment_df[f"{etf}_sentiment"] = 0.0
-            continue
-
-        aligned=series.reindex(etf_prices.index.date).fillna(0.0)
-        aligned.index=etf_prices.index  # convert Date to DatetimeIndex
-        sentiment_df[f"{etf}_sentiment"]=aligned
-    print(sentiment_df.head())
-
-    return sentiment_df
-
-
-
-if __name__=="__main__":
-    from data import load_default_etfs
-
-    prices = load_default_etfs()
-    sentiment_features = generate_etf_sentiment_features(prices)
-    print(sentiment_features.head())'''

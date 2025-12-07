@@ -254,6 +254,104 @@ def create_feature_summary(features: pd.DataFrame) -> pd.DataFrame:
     return summary
 
 
+def compute_sentiment_features(
+    prices: pd.DataFrame,
+    sentiment_df: pd.DataFrame,
+    ma_window: int = 5
+) -> pd.DataFrame:
+    """
+    Compute sentiment features aligned with price data.
+
+    Takes raw sentiment data and creates features suitable for ML models:
+    - Raw sentiment (lagged by 1 day to avoid look-ahead)
+    - Moving average sentiment
+    - Sentiment momentum
+
+    Args:
+        prices: DataFrame of prices with DatetimeIndex
+        sentiment_df: DataFrame with {ticker}_sentiment columns
+        ma_window: Window for moving average
+
+    Returns:
+        DataFrame with sentiment features aligned to prices index
+    """
+    features = pd.DataFrame(index=prices.index)
+
+    for ticker in prices.columns:
+        sentiment_col = f"{ticker}_sentiment"
+
+        if sentiment_col in sentiment_df.columns:
+            # Align sentiment to price index
+            aligned = sentiment_df[sentiment_col].reindex(prices.index)
+
+            # Forward fill missing values (weekends/holidays)
+            aligned = aligned.fillna(method="ffill").fillna(0)
+
+            # Lag by 1 day to avoid look-ahead bias
+            features[sentiment_col] = aligned.shift(1).fillna(0)
+
+            # Moving average (on lagged data)
+            features[f"{ticker}_sentiment_ma{ma_window}"] = (
+                features[sentiment_col]
+                .rolling(window=ma_window, min_periods=1)
+                .mean()
+            )
+
+            # Sentiment momentum (change over ma_window days)
+            features[f"{ticker}_sentiment_momentum"] = (
+                features[sentiment_col] -
+                features[sentiment_col].shift(ma_window)
+            ).fillna(0)
+        else:
+            # No sentiment data for this ticker - fill with zeros
+            features[sentiment_col] = 0.0
+            features[f"{ticker}_sentiment_ma{ma_window}"] = 0.0
+            features[f"{ticker}_sentiment_momentum"] = 0.0
+
+    return features
+
+
+def compute_all_features_with_sentiment(
+    prices: pd.DataFrame,
+    sentiment_df: Optional[pd.DataFrame] = None,
+    lookback_window: int = 30,
+    ma_window: int = 5,
+    include_correlations: bool = True
+) -> pd.DataFrame:
+    """
+    Compute all features including sentiment for ML models.
+
+    Combines price-based features with sentiment features into a single DataFrame.
+
+    Args:
+        prices: DataFrame of prices
+        sentiment_df: Optional DataFrame with sentiment data
+        lookback_window: Window for rolling price statistics
+        ma_window: Window for sentiment moving average
+        include_correlations: Whether to include correlation features
+
+    Returns:
+        DataFrame with all features (will have NaNs for initial lookback period)
+    """
+    # Compute price-based features
+    feature_eng = FeatureEngineer(lookback_window=lookback_window)
+    price_features = feature_eng.compute_all_features(
+        prices,
+        include_correlations=include_correlations
+    )
+
+    # Add sentiment features if available
+    if sentiment_df is not None and not sentiment_df.empty:
+        sentiment_features = compute_sentiment_features(
+            prices, sentiment_df, ma_window
+        )
+        all_features = pd.concat([price_features, sentiment_features], axis=1)
+    else:
+        all_features = price_features
+
+    return all_features
+
+
 if __name__ == "__main__":
     # Example usage
     from data import load_default_etfs, ETFDataLoader
