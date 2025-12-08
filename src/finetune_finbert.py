@@ -512,19 +512,54 @@ class FinBERTFineTuner:
             report_to="none",  # Disable wandb/tensorboard
         )
 
-        # Metric computation
+        # Metric computation with comprehensive evaluation
         def compute_metrics(eval_pred):
+            from sklearn.metrics import (
+                accuracy_score, precision_recall_fscore_support,
+                confusion_matrix, classification_report
+            )
+
             predictions, labels = eval_pred
             predictions = predictions.argmax(axis=1)
 
-            accuracy = (predictions == labels).mean()
+            # Overall accuracy
+            accuracy = accuracy_score(labels, predictions)
 
-            # Per-class accuracy
-            metrics = {"accuracy": accuracy}
-            for i, label_name in enumerate(["negative", "neutral", "positive"]):
+            # Per-class precision, recall, F1
+            precision, recall, f1, support = precision_recall_fscore_support(
+                labels, predictions, labels=[0, 1, 2], zero_division=0
+            )
+
+            # Confusion matrix for analysis
+            cm = confusion_matrix(labels, predictions, labels=[0, 1, 2])
+
+            # Build comprehensive metrics
+            metrics = {
+                "accuracy": accuracy,
+                # Macro averages (unweighted - treats all classes equally)
+                "macro_precision": precision.mean(),
+                "macro_recall": recall.mean(),
+                "macro_f1": f1.mean(),
+            }
+
+            # Per-class metrics
+            class_names = ["negative", "neutral", "positive"]
+            for i, label_name in enumerate(class_names):
+                metrics[f"precision_{label_name}"] = precision[i]
+                metrics[f"recall_{label_name}"] = recall[i]
+                metrics[f"f1_{label_name}"] = f1[i]
+                metrics[f"support_{label_name}"] = int(support[i])
+
+                # Per-class accuracy (for backward compatibility)
                 mask = labels == i
                 if mask.sum() > 0:
                     metrics[f"accuracy_{label_name}"] = (predictions[mask] == labels[mask]).mean()
+
+            # Add confusion matrix info (useful for debugging)
+            # Format: cm[true_label][predicted_label]
+            for i, true_label in enumerate(class_names):
+                for j, pred_label in enumerate(class_names):
+                    metrics[f"cm_{true_label}_as_{pred_label}"] = int(cm[i][j])
 
             return metrics
 
@@ -552,9 +587,41 @@ class FinBERTFineTuner:
         print("\nEvaluating on validation set...")
         metrics = trainer.evaluate()
 
-        print("\nFinal metrics:")
-        for key, value in metrics.items():
-            print(f"  {key}: {value:.4f}")
+        # Print formatted metrics summary
+        print("\n" + "="*80)
+        print("EVALUATION RESULTS")
+        print("="*80)
+
+        # Overall metrics
+        print(f"\nOverall Performance:")
+        print(f"  Accuracy:       {metrics['eval_accuracy']:.4f}")
+        print(f"  Macro Precision: {metrics['eval_macro_precision']:.4f}")
+        print(f"  Macro Recall:    {metrics['eval_macro_recall']:.4f}")
+        print(f"  Macro F1:        {metrics['eval_macro_f1']:.4f}")
+
+        # Per-class metrics table
+        print(f"\nPer-Class Performance:")
+        print(f"{'Class':<12} {'Precision':<12} {'Recall':<12} {'F1':<12} {'Support':<12}")
+        print("-" * 60)
+        for class_name in ["negative", "neutral", "positive"]:
+            precision = metrics[f'eval_precision_{class_name}']
+            recall = metrics[f'eval_recall_{class_name}']
+            f1 = metrics[f'eval_f1_{class_name}']
+            support = metrics[f'eval_support_{class_name}']
+            print(f"{class_name.capitalize():<12} {precision:<12.4f} {recall:<12.4f} {f1:<12.4f} {support:<12}")
+
+        # Confusion Matrix
+        print(f"\nConfusion Matrix (rows=true, cols=predicted):")
+        print(f"{'True \\ Pred':<12} {'Negative':<12} {'Neutral':<12} {'Positive':<12}")
+        print("-" * 48)
+        for true_class in ["negative", "neutral", "positive"]:
+            row = [true_class.capitalize()]
+            for pred_class in ["negative", "neutral", "positive"]:
+                count = metrics[f'eval_cm_{true_class}_as_{pred_class}']
+                row.append(f"{count:<12}")
+            print("".join(f"{item:<12}" for item in row))
+
+        print("\n" + "="*80)
 
         # Save final model
         print(f"\nSaving model to {self.config.output_dir}...")
