@@ -25,17 +25,39 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
+# Terms to EXCLUDE from queries (stock-picking noise)
+EXCLUDE_TERMS = [
+    "stock to buy",
+    "stocks to buy",
+    "buy and hold",
+    "earnings preview",
+    "earnings on deck",
+    "analyst rating",
+    "analyst calls",
+    "price target",
+    "stock picks",
+    "how to earn",
+    "invest $",
+    "with $",
+    "for $",
+]
+
 # Mapping from ETF tickers to GDELT search terms
 # Optimized for better coverage and relevance
 ETF_SEARCH_TERMS = {
     # US Equity ETFs - Large Cap
     "SPY": [
-        # S&P 500 variants (handles all spacing/punctuation)
-        "S&P 500", "SP500", "S&P500", "S&P-500", "SPX",
-        "Standard & Poor's", "Standard and Poor",
-        # Market terms
-        "Wall Street", "stock market rally", "stock market surge",
-        "equity market", "blue chip", "large cap stocks"
+        # S&P 500 index terms (specific to avoid $500 pollution)
+        "S&P 500 index", "S&P 500 rises", "S&P 500 falls",
+        "S&P 500 gains", "S&P 500 drops", "S&P 500 rally",
+        "SPX index", "Standard & Poor's 500",
+        # Market-level sentiment (not individual stocks)
+        "stock market rallies", "stock market plunges",
+        "stock market surges", "equity markets rise",
+        "equity markets fall", "US stocks rally",
+        "US stocks tumble", "Wall Street gains",
+        "Wall Street losses", "market selloff",
+        "market correction", "bull market", "bear market"
     ],
     "QQQ": [
         # NASDAQ variants
@@ -355,20 +377,29 @@ class GDELTBigQueryLoader:
         if search_terms:
             term_conditions = []
             for term in search_terms:
-                # Normalize term to catch variants (e.g., "S&P 500" -> "s%p%500")
-                # Replace special chars and spaces with % wildcards for flexible matching
+                # Use exact phrase matching with minimal normalization
+                # Only replace & with 'and' for URL matching (S&P → SandP or S-and-P)
                 normalized = term.lower()
-                # Replace common special chars with wildcards
-                for char in ['&', '-', '_', '.', ',', "'", '"']:
-                    normalized = normalized.replace(char, '%')
-                # Replace spaces with wildcards
-                normalized = normalized.replace(' ', '%')
-                # Remove consecutive % wildcards
-                while '%%' in normalized:
-                    normalized = normalized.replace('%%', '%')
-
-                term_conditions.append(f"LOWER(SOURCEURL) LIKE '%{normalized}%'")
+                # For ampersands, try both with and without
+                if '&' in normalized:
+                    # Match both "S&P" and "SandP" or "S-and-P" variants
+                    variant1 = normalized.replace('&', 'and')
+                    variant2 = normalized.replace('&', '')
+                    variant3 = normalized.replace(' ', '')  # No spaces
+                    term_conditions.append(
+                        f"(LOWER(SOURCEURL) LIKE '%{variant1}%' OR "
+                        f"LOWER(SOURCEURL) LIKE '%{variant2}%' OR "
+                        f"LOWER(SOURCEURL) LIKE '%{variant3}%')"
+                    )
+                else:
+                    # Exact phrase match (spaces intact)
+                    term_conditions.append(f"LOWER(SOURCEURL) LIKE '%{normalized}%'")
             where_clauses.append(f"({' OR '.join(term_conditions)})")
+
+        # Add EXCLUDE filters to remove stock-picking articles
+        if EXCLUDE_TERMS:
+            exclude_conditions = [f"LOWER(SOURCEURL) NOT LIKE '%{term.lower()}%'" for term in EXCLUDE_TERMS]
+            where_clauses.extend(exclude_conditions)
 
         if domains:
             domain_conditions = [f"SOURCEURL LIKE '%{d}%'" for d in domains]

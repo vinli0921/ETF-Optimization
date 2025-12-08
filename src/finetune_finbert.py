@@ -99,7 +99,7 @@ class ETFSentimentDatasetBuilder:
         self,
         prices: pd.Series,
         dates: pd.DatetimeIndex,
-        horizon: int = 5  # 5-day forward return
+        horizon: int = 1  # 1-day forward return (shorter window = less noise)
     ) -> pd.Series:
         """
         Compute forward returns for sentiment labeling.
@@ -107,7 +107,7 @@ class ETFSentimentDatasetBuilder:
         Args:
             prices: Price series
             dates: Dates for which to compute returns
-            horizon: Number of days forward to look
+            horizon: Number of days forward to look (1 day for tighter signal)
 
         Returns:
             Series of forward returns indexed by date
