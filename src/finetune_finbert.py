@@ -302,7 +302,22 @@ class ETFSentimentDatasetBuilder:
             except Exception as e:
                 returns_list.append(np.nan)
 
-        news_data['return'] = returns_list
+        # Ensure all returns are scalar floats (flatten any nested structures)
+        returns_list_flat = []
+        for ret in returns_list:
+            if isinstance(ret, (pd.Series, list, np.ndarray)):
+                # Flatten to scalar
+                if hasattr(ret, '__len__') and len(ret) > 0:
+                    ret = float(ret[0]) if not pd.isna(ret[0]) else np.nan
+                else:
+                    ret = np.nan
+            elif pd.isna(ret):
+                ret = np.nan
+            else:
+                ret = float(ret)
+            returns_list_flat.append(ret)
+
+        news_data['return'] = returns_list_flat
 
         # Remove NaN returns
         before_drop = len(news_data)
@@ -314,6 +329,11 @@ class ETFSentimentDatasetBuilder:
         if news_data.empty:
             print(f"  No valid returns for {ticker}")
             return pd.DataFrame(columns=['headline', 'label', 'ticker', 'date', 'return'])
+
+        # Verify returns are clean floats
+        if not news_data['return'].dtype in [np.float64, np.float32, float]:
+            print(f"  WARNING: return dtype is {news_data['return'].dtype}, converting to float")
+            news_data['return'] = news_data['return'].astype(float)
 
         # Assign labels (per-ticker percentiles for volatility adaptation)
         print(f"  Assigning labels using per-ticker percentiles...")

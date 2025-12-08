@@ -30,15 +30,22 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 ETF_SEARCH_TERMS = {
     # US Equity ETFs - Large Cap
     "SPY": [
-        "S&P 500", "SP500", "S&P500",
-        "Wall Street", "Dow Jones", "stock market rally",
-        "equity market", "blue chip stocks"
+        # S&P 500 variants (handles all spacing/punctuation)
+        "S&P 500", "SP500", "S&P500", "S&P-500", "SPX",
+        "Standard & Poor's", "Standard and Poor",
+        # Market terms
+        "Wall Street", "stock market rally", "stock market surge",
+        "equity market", "blue chip", "large cap stocks"
     ],
     "QQQ": [
-        "NASDAQ", "Nasdaq", "NASDAQ-100",
-        "tech stocks", "technology shares", "Silicon Valley",
-        "Apple", "Microsoft", "Amazon", "Tesla",
-        "big tech"
+        # NASDAQ variants
+        "NASDAQ", "Nasdaq", "NASDAQ-100", "NASDAQ 100", "NDX",
+        # Tech sector
+        "tech stocks", "technology shares", "technology sector",
+        "Silicon Valley", "big tech", "mega cap tech",
+        # Major holdings (FAANG+)
+        "Apple", "Microsoft", "Amazon", "Tesla", "Google", "Meta",
+        "Nvidia", "Facebook"
     ],
     "VTI": [
         "US equities", "American stocks", "total market",
@@ -47,9 +54,15 @@ ETF_SEARCH_TERMS = {
 
     # US Small Cap
     "IWM": [
-        "Russell 2000", "small cap", "small-cap stocks",
-        "mid cap", "growth stocks", "value stocks",
-        "regional banks"
+        # Russell 2000 variants
+        "Russell 2000", "Russell2000", "RUT", "RTY",
+        # Small cap terms
+        "small cap", "small-cap", "small cap stocks", "smallcap",
+        "mid cap", "mid-cap", "midcap",
+        # Style
+        "growth stocks", "value stocks", "small cap index",
+        # Related
+        "regional banks", "smaller companies", "small business"
     ],
 
     # Bond ETFs
@@ -67,9 +80,18 @@ ETF_SEARCH_TERMS = {
 
     # Commodities
     "GLD": [
-        "gold price", "gold prices", "gold market",
-        "precious metals", "gold bullion", "gold ETF",
-        "safe haven", "gold miners", "bullion"
+        # Gold price terms
+        "gold price", "gold prices", "gold rally", "gold surge",
+        "gold falls", "gold drops", "gold market",
+        # Gold products
+        "gold bullion", "gold bars", "physical gold",
+        # Investment terms
+        "gold ETF", "gold investment", "gold assets",
+        # Related terms
+        "precious metals", "safe haven", "haven asset",
+        "gold miners", "mining stocks", "Newmont", "Barrick",
+        # Variants
+        "XAU", "gold futures", "spot gold"
     ],
 
     # International - Developed Markets
@@ -333,7 +355,19 @@ class GDELTBigQueryLoader:
         if search_terms:
             term_conditions = []
             for term in search_terms:
-                term_conditions.append(f"LOWER(SOURCEURL) LIKE '%{term.lower().replace(' ', '%')}%'")
+                # Normalize term to catch variants (e.g., "S&P 500" -> "s%p%500")
+                # Replace special chars and spaces with % wildcards for flexible matching
+                normalized = term.lower()
+                # Replace common special chars with wildcards
+                for char in ['&', '-', '_', '.', ',', "'", '"']:
+                    normalized = normalized.replace(char, '%')
+                # Replace spaces with wildcards
+                normalized = normalized.replace(' ', '%')
+                # Remove consecutive % wildcards
+                while '%%' in normalized:
+                    normalized = normalized.replace('%%', '%')
+
+                term_conditions.append(f"LOWER(SOURCEURL) LIKE '%{normalized}%'")
             where_clauses.append(f"({' OR '.join(term_conditions)})")
 
         if domains:
