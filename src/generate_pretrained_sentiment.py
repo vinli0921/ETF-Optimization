@@ -29,6 +29,11 @@ def main():
         finbert_model_path=None  # Use pre-trained model (not fine-tuned)
     )
 
+    # Ensure date is a column (compute_sentiment_bigquery returns DatetimeIndex)
+    if sentiment_df.index.name != 'date':
+        sentiment_df.index.name = 'date'
+    sentiment_df = sentiment_df.reset_index()
+
     # Save results
     output_path = 'data/sentiment_pretrained.csv'
     sentiment_df.to_csv(output_path, index=False)

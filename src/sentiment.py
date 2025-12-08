@@ -50,7 +50,7 @@ ETF_SEARCH_TERMS = {
         # S&P 500 index terms (specific to avoid $500 pollution)
         "S&P 500 index", "S&P 500 rises", "S&P 500 falls",
         "S&P 500 gains", "S&P 500 drops", "S&P 500 rally",
-        "SPX index", "Standard & Poor's 500",
+        "SPX index",
         # Market-level sentiment (not individual stocks)
         "stock market rallies", "stock market plunges",
         "stock market surges", "equity markets rise",
@@ -380,12 +380,17 @@ class GDELTBigQueryLoader:
                 # Use exact phrase matching with minimal normalization
                 # Only replace & with 'and' for URL matching (S&P → SandP or S-and-P)
                 normalized = term.lower()
+
+                # Escape apostrophes for SQL (double them)
+                def sql_escape(s):
+                    return s.replace("'", "''")
+
                 # For ampersands, try both with and without
                 if '&' in normalized:
                     # Match both "S&P" and "SandP" or "S-and-P" variants
-                    variant1 = normalized.replace('&', 'and')
-                    variant2 = normalized.replace('&', '')
-                    variant3 = normalized.replace(' ', '')  # No spaces
+                    variant1 = sql_escape(normalized.replace('&', 'and'))
+                    variant2 = sql_escape(normalized.replace('&', ''))
+                    variant3 = sql_escape(normalized.replace(' ', ''))  # No spaces
                     term_conditions.append(
                         f"(LOWER(SOURCEURL) LIKE '%{variant1}%' OR "
                         f"LOWER(SOURCEURL) LIKE '%{variant2}%' OR "
@@ -393,12 +398,15 @@ class GDELTBigQueryLoader:
                     )
                 else:
                     # Exact phrase match (spaces intact)
-                    term_conditions.append(f"LOWER(SOURCEURL) LIKE '%{normalized}%'")
+                    normalized_escaped = sql_escape(normalized)
+                    term_conditions.append(f"LOWER(SOURCEURL) LIKE '%{normalized_escaped}%'")
             where_clauses.append(f"({' OR '.join(term_conditions)})")
 
         # Add EXCLUDE filters to remove stock-picking articles
         if EXCLUDE_TERMS:
-            exclude_conditions = [f"LOWER(SOURCEURL) NOT LIKE '%{term.lower()}%'" for term in EXCLUDE_TERMS]
+            def sql_escape(s):
+                return s.replace("'", "''")
+            exclude_conditions = [f"LOWER(SOURCEURL) NOT LIKE '%{sql_escape(term.lower())}%'" for term in EXCLUDE_TERMS]
             where_clauses.extend(exclude_conditions)
 
         if domains:
