@@ -216,33 +216,40 @@ class ETFSentimentDatasetBuilder:
 
         # Compute returns row by row to handle duplicate dates
         returns_list = []
+
+        # Normalize dates to date-only (remove time component)
+        prices.index = pd.to_datetime(prices.index).date
+        prices.index = pd.DatetimeIndex(prices.index)
+
         for idx, row in news_data.iterrows():
-            date = row['date']
+            article_date = pd.to_datetime(row['date']).date()
+
             try:
-                # Find price at date
-                if date not in prices.index:
-                    prior_dates = prices.index[prices.index <= date]
-                    if len(prior_dates) == 0:
-                        returns_list.append(np.nan)
-                        continue
-                    date = prior_dates[-1]
+                # Find nearest prior price date
+                price_dates_normalized = [d.date() for d in prices.index]
 
-                current_price = prices[date]
-
-                # Find price 5 days later
-                future_dates = prices.index[prices.index > date]
-                if len(future_dates) < 5:
+                # Find matching or prior date
+                matching_dates = [d for d in price_dates_normalized if d <= article_date]
+                if not matching_dates:
                     returns_list.append(np.nan)
                     continue
 
-                future_date = future_dates[min(4, len(future_dates)-1)]
-                future_price = prices[future_date]
+                current_date = max(matching_dates)
+                current_date_idx = price_dates_normalized.index(current_date)
+                current_price = prices.iloc[current_date_idx]
+
+                # Find price 5 trading days later
+                if current_date_idx + 5 >= len(prices):
+                    returns_list.append(np.nan)
+                    continue
+
+                future_price = prices.iloc[current_date_idx + 5]
 
                 # Compute return
                 ret = (future_price - current_price) / current_price
                 returns_list.append(ret)
 
-            except Exception:
+            except Exception as e:
                 returns_list.append(np.nan)
 
         news_data['return'] = returns_list
@@ -464,9 +471,11 @@ def main():
     print(f"Date range: {config.start_date} to {config.end_date}")
     print(f"Device: {config.device}")
     print(f"Output: {config.output_dir}")
+    print(f"ETFs: 10 (expanded universe)")
+    print(f"Expected dataset size: ~30,000 labeled headlines")
 
-    # ETFs to train on
-    tickers = ['SPY', 'QQQ', 'TLT', 'GLD', 'VTI', 'BND']
+    # ETFs to train on - use full expanded universe
+    tickers = ['SPY', 'QQQ', 'VTI', 'TLT', 'BND', 'GLD', 'VEA', 'VWO', 'IWM', 'XLE']
 
     # Step 1: Build labeled dataset
     print("\n" + "="*80)
