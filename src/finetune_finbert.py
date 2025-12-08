@@ -145,35 +145,63 @@ class ETFSentimentDatasetBuilder:
 
         return pd.Series(forward_returns, index=dates)
 
-    def _assign_labels(self, returns: pd.Series) -> List[int]:
+    def _assign_labels(self, returns: pd.Series, ticker: str) -> List[int]:
         """
-        Assign sentiment labels based on forward returns.
+        Assign sentiment labels based on forward returns using PER-TICKER PERCENTILE approach.
+
+        Best practices implemented:
+        - Per-ticker percentiles (adapts to each ETF's volatility)
+        - Handles ties deterministically (>= and <= for consistent splits)
+        - Computed on entire ticker dataset (valid for supervised learning)
+        - Logs class distribution for validation
 
         Labels:
-        - 2 (positive): return > threshold
-        - 1 (neutral): -threshold <= return <= threshold
-        - 0 (negative): return < -threshold
+        - 2 (positive): return >= 67th percentile (top ~33%)
+        - 1 (neutral): return between 33rd and 67th percentile (middle ~34%)
+        - 0 (negative): return <= 33rd percentile (bottom ~33%)
+
+        Note: This is per-ticker to handle different volatility profiles
+        (e.g., SPY vs TLT have very different return distributions)
         """
-        threshold = self.config.min_return_threshold
+        # Compute percentile thresholds on this ticker's returns
+        # Using 0.33 and 0.67 for roughly equal splits
+        lower_threshold = returns.quantile(0.33)
+        upper_threshold = returns.quantile(0.67)
+
+        print(f"    Percentile thresholds for {ticker}:")
+        print(f"      33rd percentile (negative cutoff): {lower_threshold*100:.3f}%")
+        print(f"      67th percentile (positive cutoff): {upper_threshold*100:.3f}%")
 
         labels = []
-        for ret in returns.values:  # Use .values to get numpy array
+        for ret in returns.values:
             # Normalize to scalar in case an element is a Series/array
             if isinstance(ret, pd.Series):
                 ret = ret.iloc[0] if len(ret) > 0 else np.nan
             elif isinstance(ret, (list, np.ndarray)):
                 ret = ret[0] if len(ret) > 0 else np.nan
 
-            # After dropna, NaNs should not be present; guard to catch issues
+            # After dropna, NaNs should not be present
             if pd.isna(ret):
                 raise ValueError("NaN forward return encountered during labeling; ensure dropna before labeling.")
 
-            if ret > threshold:
-                labels.append(2)  # Positive
-            elif ret < -threshold:
-                labels.append(0)  # Negative
+            # Percentile-based labeling with deterministic tie-handling
+            # Using >= and <= ensures consistent assignment at boundaries
+            if ret >= upper_threshold:
+                labels.append(2)  # Positive (top ~33%)
+            elif ret <= lower_threshold:
+                labels.append(0)  # Negative (bottom ~33%)
             else:
-                labels.append(1)  # Neutral
+                labels.append(1)  # Neutral (middle ~34%)
+
+        # Validate class distribution
+        label_counts = pd.Series(labels).value_counts().sort_index()
+        total = len(labels)
+        print(f"    Class distribution for {ticker}:")
+        for label_id in [0, 1, 2]:
+            count = label_counts.get(label_id, 0)
+            pct = count / total * 100
+            label_name = ["Negative", "Neutral", "Positive"][label_id]
+            print(f"      {label_name} ({label_id}): {count} ({pct:.1f}%)")
 
         return labels
 
@@ -287,8 +315,9 @@ class ETFSentimentDatasetBuilder:
             print(f"  No valid returns for {ticker}")
             return pd.DataFrame(columns=['headline', 'label', 'ticker', 'date', 'return'])
 
-        # Assign labels
-        news_data['label'] = self._assign_labels(news_data['return'])
+        # Assign labels (per-ticker percentiles for volatility adaptation)
+        print(f"  Assigning labels using per-ticker percentiles...")
+        news_data['label'] = self._assign_labels(news_data['return'], ticker)
         news_data['ticker'] = ticker
 
         # Sample to limit size
@@ -392,17 +421,15 @@ class FinBERTFineTuner:
         print(f"Train size: {len(train_df)}")
         print(f"Eval size: {len(eval_df)}")
 
-        # Compute class weights to handle imbalance
-        class_weights = compute_class_weight(
-            'balanced',
-            classes=np.array([0, 1, 2]),
-            y=train_df['label'].values
-        )
-        self.class_weights = class_weights.tolist()
-        print(f"\nClass weights (to balance loss):")
-        print(f"  Negative (0): {self.class_weights[0]:.3f}")
-        print(f"  Neutral (1):  {self.class_weights[1]:.3f}")
-        print(f"  Positive (2): {self.class_weights[2]:.3f}")
+        # Check class distribution
+        class_dist = train_df['label'].value_counts(normalize=True).sort_index()
+        print(f"\nClass distribution in training set:")
+        print(f"  Negative (0): {class_dist[0]:.1%}")
+        print(f"  Neutral (1):  {class_dist[1]:.1%}")
+        print(f"  Positive (2): {class_dist[2]:.1%}")
+
+        # No class weights needed with percentile-based labeling (naturally balanced)
+        self.class_weights = None
 
         # Convert to Hugging Face Dataset format
         train_dataset = Dataset.from_pandas(train_df[['headline', 'label']])
@@ -481,9 +508,8 @@ class FinBERTFineTuner:
 
             return metrics
 
-        # Trainer (with class weights for balanced training)
-        trainer = WeightedTrainer(
-            class_weights=self.class_weights,
+        # Trainer (no class weights needed with balanced percentile labeling)
+        trainer = Trainer(
             model=self.model,
             args=training_args,
             train_dataset=train_dataset,
@@ -522,24 +548,32 @@ class FinBERTFineTuner:
 
 def main():
     """Main fine-tuning pipeline."""
-    # Configuration (improved for better class balance)
+    # Configuration (optimized for MAXIMUM accuracy)
     config = FineTuneConfig(
         start_date="2017-01-01",  # 8 years of data (includes COVID crash)
         end_date="2024-12-31",
         max_headlines_per_etf=5000,  # 5k headlines per ETF
-        min_return_threshold=0.005,  # 0.5% threshold (was 1%)
-        num_epochs=3,
+        min_return_threshold=0.005,  # Not used (percentile-based labeling)
+        num_epochs=5,  # More epochs for better convergence
         batch_size=16,
+        learning_rate=2e-5,  # Optimal for FinBERT fine-tuning
     )
 
     print(f"{'='*80}")
-    print("FinBERT Fine-Tuning for ETF Sentiment Analysis")
+    print("FinBERT Fine-Tuning for ETF Sentiment Analysis (OPTIMIZED)")
     print(f"{'='*80}")
     print(f"Date range: {config.start_date} to {config.end_date} (8 years)")
-    print(f"Return threshold: {config.min_return_threshold*100}% (lower = better balance)")
+    print(f"Labeling: PERCENTILE-BASED (33/34/33 split)")
     print(f"Device: {config.device}")
     print(f"Output: {config.output_dir}")
     print(f"ETFs: 10 (expanded universe)")
+    print(f"Epochs: {config.num_epochs}")
+    print(f"\nKey Optimizations:")
+    print(f"  ✓ Percentile-based labeling (perfect class balance)")
+    print(f"  ✓ No class weights (balanced by design)")
+    print(f"  ✓ 5 epochs with early stopping")
+    print(f"  ✓ Optimal learning rate (2e-5)")
+    print(f"  ✓ 32 finance domains + optimized search terms")
 
     # ETFs to train on - use full expanded universe
     tickers = ['SPY', 'QQQ', 'VTI', 'TLT', 'BND', 'GLD', 'VEA', 'VWO', 'IWM', 'XLE']
