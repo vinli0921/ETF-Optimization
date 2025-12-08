@@ -47,17 +47,16 @@ EXCLUDE_TERMS = [
 ETF_SEARCH_TERMS = {
     # US Equity ETFs - Large Cap
     "SPY": [
-        # S&P 500 index terms (specific to avoid $500 pollution)
-        "S&P 500 index", "S&P 500 rises", "S&P 500 falls",
-        "S&P 500 gains", "S&P 500 drops", "S&P 500 rally",
-        "SPX index",
-        # Market-level sentiment (not individual stocks)
-        "stock market rallies", "stock market plunges",
-        "stock market surges", "equity markets rise",
-        "equity markets fall", "US stocks rally",
-        "US stocks tumble", "Wall Street gains",
-        "Wall Street losses", "market selloff",
-        "market correction", "bull market", "bear market"
+        # S&P 500 variants as they appear in URLs (no $500 pollution)
+        "sp500", "sandp500", "sandp-500", "s-and-p-500",
+        "spx", "spy etf",
+        # Market-level sentiment with action words
+        "stock market rally", "stock market plunge",
+        "stock market surge", "stock market crash",
+        "stock market sell", "stock market gain",
+        "equity market", "us stocks", "wall street",
+        "market selloff", "market correction",
+        "bull market", "bear market", "market volatility"
     ],
     "QQQ": [
         # NASDAQ variants
