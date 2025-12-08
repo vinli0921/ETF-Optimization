@@ -26,6 +26,7 @@ from transformers import (
 )
 from datasets import Dataset
 from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 
 # Local imports
 from sentiment import GDELTBigQueryLoader, HeadlineScraper, ETF_SEARCH_TERMS, FINANCE_DOMAINS
@@ -36,10 +37,10 @@ import yfinance as yf
 class FineTuneConfig:
     """Configuration for fine-tuning."""
     # Data parameters
-    start_date: str = "2020-01-01"  # Start date for training data
+    start_date: str = "2017-01-01"  # Start date for training data (extended for more volatility)
     end_date: str = "2024-12-31"    # End date for training data
     max_headlines_per_etf: int = 5000  # Max headlines per ETF
-    min_return_threshold: float = 0.01  # 1% - threshold for strong signal
+    min_return_threshold: float = 0.005  # 0.5% - lower threshold for better class balance
 
     # Model parameters
     model_name: str = "ProsusAI/finbert"
@@ -333,6 +334,32 @@ class ETFSentimentDatasetBuilder:
         return full_dataset
 
 
+class WeightedTrainer(Trainer):
+    """Custom Trainer with class weights for imbalanced datasets."""
+
+    def __init__(self, class_weights=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.class_weights = class_weights
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """Override to apply class weights to loss."""
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        # Compute weighted cross-entropy loss
+        if self.class_weights is not None:
+            import torch.nn.functional as F
+            loss_fct = torch.nn.CrossEntropyLoss(
+                weight=torch.tensor(self.class_weights, dtype=torch.float32).to(logits.device)
+            )
+            loss = loss_fct(logits, labels)
+        else:
+            loss = outputs.loss
+
+        return (loss, outputs) if return_outputs else loss
+
+
 class FinBERTFineTuner:
     """Fine-tune FinBERT on labeled sentiment data."""
 
@@ -340,6 +367,7 @@ class FinBERTFineTuner:
         self.config = config
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
         self.model = None
+        self.class_weights = None
 
     def prepare_dataset(self, df: pd.DataFrame) -> Tuple[Dataset, Dataset]:
         """
@@ -363,6 +391,18 @@ class FinBERTFineTuner:
 
         print(f"Train size: {len(train_df)}")
         print(f"Eval size: {len(eval_df)}")
+
+        # Compute class weights to handle imbalance
+        class_weights = compute_class_weight(
+            'balanced',
+            classes=np.array([0, 1, 2]),
+            y=train_df['label'].values
+        )
+        self.class_weights = class_weights.tolist()
+        print(f"\nClass weights (to balance loss):")
+        print(f"  Negative (0): {self.class_weights[0]:.3f}")
+        print(f"  Neutral (1):  {self.class_weights[1]:.3f}")
+        print(f"  Positive (2): {self.class_weights[2]:.3f}")
 
         # Convert to Hugging Face Dataset format
         train_dataset = Dataset.from_pandas(train_df[['headline', 'label']])
@@ -441,8 +481,9 @@ class FinBERTFineTuner:
 
             return metrics
 
-        # Trainer
-        trainer = Trainer(
+        # Trainer (with class weights for balanced training)
+        trainer = WeightedTrainer(
+            class_weights=self.class_weights,
             model=self.model,
             args=training_args,
             train_dataset=train_dataset,
@@ -481,11 +522,12 @@ class FinBERTFineTuner:
 
 def main():
     """Main fine-tuning pipeline."""
-    # Configuration
+    # Configuration (improved for better class balance)
     config = FineTuneConfig(
-        start_date="2020-01-01",  # 5 years of data
+        start_date="2017-01-01",  # 8 years of data (includes COVID crash)
         end_date="2024-12-31",
-        max_headlines_per_etf=3000,  # 3k headlines per ETF
+        max_headlines_per_etf=5000,  # 5k headlines per ETF
+        min_return_threshold=0.005,  # 0.5% threshold (was 1%)
         num_epochs=3,
         batch_size=16,
     )
@@ -493,11 +535,11 @@ def main():
     print(f"{'='*80}")
     print("FinBERT Fine-Tuning for ETF Sentiment Analysis")
     print(f"{'='*80}")
-    print(f"Date range: {config.start_date} to {config.end_date}")
+    print(f"Date range: {config.start_date} to {config.end_date} (8 years)")
+    print(f"Return threshold: {config.min_return_threshold*100}% (lower = better balance)")
     print(f"Device: {config.device}")
     print(f"Output: {config.output_dir}")
     print(f"ETFs: 10 (expanded universe)")
-    print(f"Expected dataset size: ~30,000 labeled headlines")
 
     # ETFs to train on - use full expanded universe
     tickers = ['SPY', 'QQQ', 'VTI', 'TLT', 'BND', 'GLD', 'VEA', 'VWO', 'IWM', 'XLE']
