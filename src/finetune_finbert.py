@@ -156,7 +156,18 @@ class ETFSentimentDatasetBuilder:
         threshold = self.config.min_return_threshold
 
         labels = []
-        for ret in returns:
+        for ret in returns.values:  # Use .values to get numpy array
+            # Normalize to scalar in case an element is a Series/array
+            if isinstance(ret, pd.Series):
+                ret = ret.iloc[0] if len(ret) > 0 else np.nan
+            elif isinstance(ret, (list, np.ndarray)):
+                ret = ret[0] if len(ret) > 0 else np.nan
+
+            # Handle NaNs safely
+            if pd.isna(ret):
+                labels.append(1)  # Treat unknown as neutral
+                continue
+
             if ret > threshold:
                 labels.append(2)  # Positive
             elif ret < -threshold:
