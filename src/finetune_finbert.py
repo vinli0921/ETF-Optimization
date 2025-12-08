@@ -213,8 +213,39 @@ class ETFSentimentDatasetBuilder:
 
         # Compute forward returns for labeling
         print(f"  Computing forward returns...")
-        forward_returns = self._compute_forward_returns(prices, news_data['date'])
-        news_data['return'] = forward_returns
+
+        # Compute returns row by row to handle duplicate dates
+        returns_list = []
+        for idx, row in news_data.iterrows():
+            date = row['date']
+            try:
+                # Find price at date
+                if date not in prices.index:
+                    prior_dates = prices.index[prices.index <= date]
+                    if len(prior_dates) == 0:
+                        returns_list.append(np.nan)
+                        continue
+                    date = prior_dates[-1]
+
+                current_price = prices[date]
+
+                # Find price 5 days later
+                future_dates = prices.index[prices.index > date]
+                if len(future_dates) < 5:
+                    returns_list.append(np.nan)
+                    continue
+
+                future_date = future_dates[min(4, len(future_dates)-1)]
+                future_price = prices[future_date]
+
+                # Compute return
+                ret = (future_price - current_price) / current_price
+                returns_list.append(ret)
+
+            except Exception:
+                returns_list.append(np.nan)
+
+        news_data['return'] = returns_list
 
         # Remove NaN returns
         news_data = news_data.dropna(subset=['return'])
