@@ -691,16 +691,20 @@ class RiskAdjustedLSTMStrategy(BaseStrategy):
         if len(returns)<window:
             return returns.std() if len(returns) > 0 else 1e-6
         return returns.tail(window).std()
-    
+    def train_on_data(self, prices):
+        self.models = {}
+        for ticker in prices.columns:
+            self.models[ticker] = self._train_model(prices[ticker])
+
     def allocate(self,prices,current_date=None,**kwargs):
         if current_date is not None:
             price=prices.loc[:current_date]
         else:
             price = prices
         tickers=list(prices.columns)
-        if not self.models:
+        '''if not self.models:
             for ticker in tickers:
-                self.models[ticker]=self._train_model(prices[ticker])
+                self.models[ticker]=self._train_model(prices[ticker])'''
         
         pred_returns={}
         vol={}
