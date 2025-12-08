@@ -222,6 +222,13 @@ class ETFSentimentDatasetBuilder:
             print(f"  No valid headlines for {ticker}")
             return pd.DataFrame(columns=['headline', 'label', 'ticker', 'date', 'return'])
 
+        # Dedupe by headline and date (and URL as tie-breaker) to avoid repeated samples
+        before_dedupe = len(news_data)
+        news_data = news_data.drop_duplicates(subset=['headline', 'date', 'url'])
+        deduped = before_dedupe - len(news_data)
+        if deduped > 0:
+            print(f"  Removed {deduped} duplicate headline/date/url rows")
+
         # Download ETF prices
         prices = self._fetch_etf_prices(ticker)
 
