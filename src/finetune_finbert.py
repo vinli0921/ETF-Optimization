@@ -163,10 +163,9 @@ class ETFSentimentDatasetBuilder:
             elif isinstance(ret, (list, np.ndarray)):
                 ret = ret[0] if len(ret) > 0 else np.nan
 
-            # Handle NaNs safely
+            # After dropna, NaNs should not be present; guard to catch issues
             if pd.isna(ret):
-                labels.append(1)  # Treat unknown as neutral
-                continue
+                raise ValueError("NaN forward return encountered during labeling; ensure dropna before labeling.")
 
             if ret > threshold:
                 labels.append(2)  # Positive
@@ -270,7 +269,11 @@ class ETFSentimentDatasetBuilder:
         news_data['return'] = returns_list
 
         # Remove NaN returns
+        before_drop = len(news_data)
         news_data = news_data.dropna(subset=['return'])
+        dropped = before_drop - len(news_data)
+        if dropped > 0:
+            print(f"  Dropped {dropped} rows with NaN forward returns")
 
         if news_data.empty:
             print(f"  No valid returns for {ticker}")
