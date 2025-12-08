@@ -67,12 +67,13 @@ class FinBertSentiment:
     - Zero indicates neutral sentiment
     """
 
-    def __init__(self, device: str = None):
+    def __init__(self, device: str = None, model_path: str = None):
         """
         Initialize FinBERT model.
 
         Args:
             device: 'cuda', 'mps', or 'cpu'. Auto-detected if None.
+            model_path: Path to fine-tuned model. If None, uses pre-trained FinBERT.
         """
         import torch
         from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -87,10 +88,19 @@ class FinBertSentiment:
 
         self.device = device
         self.torch = torch
-        print(f"Loading FinBERT model on {device}...")
 
-        self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
-        self.model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+        # Load model (fine-tuned or pre-trained)
+        if model_path is not None and os.path.exists(model_path):
+            print(f"Loading fine-tuned FinBERT model from {model_path} on {device}...")
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self.model = AutoModelForSequenceClassification.from_pretrained(model_path)
+            self.is_finetuned = True
+        else:
+            print(f"Loading pre-trained FinBERT model on {device}...")
+            self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+            self.model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+            self.is_finetuned = False
+
         self.model.to(self.device)
         self.model.eval()
 
@@ -462,6 +472,7 @@ def compute_sentiment_bigquery(
     force_refresh: bool = False,
     use_gkg_tone: bool = True,
     max_articles_per_day: int = 100,
+    finbert_model_path: str = None,
 ) -> pd.DataFrame:
     """
     Compute sentiment using GDELT BigQuery + FinBERT.
@@ -480,6 +491,7 @@ def compute_sentiment_bigquery(
         use_gkg_tone: If True, use GDELT's built-in tone scores (faster)
                       If False, fetch headlines and run FinBERT (more accurate)
         max_articles_per_day: Max articles to process per day
+        finbert_model_path: Path to fine-tuned FinBERT model (optional)
 
     Returns:
         DataFrame with columns: {ticker}_sentiment for each ticker
@@ -581,7 +593,7 @@ def compute_sentiment_bigquery(
                 continue
 
             print(f"  Scoring {len(data)} headlines with FinBERT...")
-            finbert = FinBertSentiment()
+            finbert = FinBertSentiment(model_path=finbert_model_path)
             data["sentiment"] = finbert.score_batch(data["headline"].tolist())
 
             # Aggregate by date
