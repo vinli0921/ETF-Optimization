@@ -615,7 +615,7 @@ def create_60_40_strategy(stock_tickers: list, bond_tickers: list) -> StaticStra
     return StaticStrategy(weights)
 
 class RiskAdjustedLSTMStrategy(BaseStrategy):
-    def __init__(self,lookback=30,hidden_dim=32,epochs=30,lr=1e-3,num_layers=1,dropout=0.0,target_horizon=5,vol_window=20):
+    def __init__(self,lookback,hidden_dim,epochs,lr=1e-3,num_layers=1,dropout=0.0,target_horizon=5,vol_window=20):
         super().__init__("Risk Adjusted LSTM")
         self.lookback=lookback
         self.hidden_dim=hidden_dim
