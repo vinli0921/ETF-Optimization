@@ -26,34 +26,123 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 # Mapping from ETF tickers to GDELT search terms
-# These are used in BigQuery WHERE clauses
+# Optimized for better coverage and relevance
 ETF_SEARCH_TERMS = {
-    # US Equity ETFs - search for market-related terms
-    "SPY": ["stock market", "S&P 500", "Wall Street", "equities"],
-    "QQQ": ["NASDAQ", "tech stocks", "technology sector"],
-    "VTI": ["stock market", "US stocks", "equities"],
-    "IWM": ["small cap", "Russell 2000", "small stocks"],
+    # US Equity ETFs - Large Cap
+    "SPY": [
+        "S&P 500", "SP500", "S&P500",
+        "Wall Street", "Dow Jones", "stock market rally",
+        "equity market", "blue chip stocks"
+    ],
+    "QQQ": [
+        "NASDAQ", "Nasdaq", "NASDAQ-100",
+        "tech stocks", "technology shares", "Silicon Valley",
+        "Apple", "Microsoft", "Amazon", "Tesla",
+        "big tech"
+    ],
+    "VTI": [
+        "US equities", "American stocks", "total market",
+        "broad market", "stock index", "equity index"
+    ],
+
+    # US Small Cap
+    "IWM": [
+        "Russell 2000", "small cap", "small-cap stocks",
+        "mid cap", "growth stocks", "value stocks",
+        "regional banks"
+    ],
 
     # Bond ETFs
-    "TLT": ["treasury bonds", "interest rates", "Federal Reserve", "yields"],
-    "BND": ["bond market", "fixed income", "treasury"],
+    "TLT": [
+        "Treasury bonds", "government bonds", "long-term bonds",
+        "10-year yield", "30-year yield", "bond yields",
+        "Federal Reserve", "interest rates", "rate hike",
+        "inflation"
+    ],
+    "BND": [
+        "bond market", "fixed income", "corporate bonds",
+        "investment grade", "bond yields", "credit market",
+        "debt market"
+    ],
 
-    # Commodity ETFs
-    "GLD": ["gold price", "gold market", "precious metals"],
+    # Commodities
+    "GLD": [
+        "gold price", "gold prices", "gold market",
+        "precious metals", "gold bullion", "gold ETF",
+        "safe haven", "gold miners", "bullion"
+    ],
 
-    # International ETFs
-    "VEA": ["European stocks", "Japan stocks", "international markets"],
-    "VWO": ["emerging markets", "China stocks", "developing markets"],
+    # International - Developed Markets
+    "VEA": [
+        "European stocks", "European markets", "FTSE",
+        "DAX", "CAC 40", "Japan stocks", "Nikkei",
+        "developed markets", "international equities",
+        "eurozone", "UK stocks", "Germany economy"
+    ],
 
-    # Sector ETFs
-    "XLE": ["oil price", "energy sector", "crude oil", "petroleum"],
+    # International - Emerging Markets
+    "VWO": [
+        "emerging markets", "emerging economies",
+        "China stocks", "Chinese economy", "Shanghai",
+        "India stocks", "Brazil stocks", "BRICS",
+        "developing markets", "frontier markets",
+        "EM equities"
+    ],
+
+    # Sector - Energy
+    "XLE": [
+        "oil price", "oil prices", "crude oil",
+        "energy sector", "energy stocks", "petroleum",
+        "Exxon", "Chevron", "OPEC", "natural gas",
+        "energy crisis", "oil production", "shale"
+    ],
 }
 
 # Finance-focused domains for filtering
+# Based on 2025 research of top financial news sources
 FINANCE_DOMAINS = [
-    "reuters.com", "bloomberg.com", "wsj.com", "ft.com",
-    "cnbc.com", "marketwatch.com", "finance.yahoo.com",
-    "seekingalpha.com", "businessinsider.com", "forbes.com",
+    # Tier 1: Premier Financial News (Institutional Grade)
+    "bloomberg.com",           # Bloomberg - Professional standard
+    "wsj.com",                 # Wall Street Journal - 39 Pulitzer Prizes
+    "reuters.com",             # Reuters - Real-time global news
+    "ft.com",                  # Financial Times - International authority
+    "financialtimes.com",      # FT alternate domain
+
+    # Tier 2: Major Business News Networks
+    "cnbc.com",                # CNBC - Real-time market coverage
+    "barrons.com",             # Barron's - Investment analysis
+    "economist.com",           # The Economist - Economic policy depth
+    "forbes.com",              # Forbes - Business & markets
+    "fortune.com",             # Fortune - Corporate news
+
+    # Tier 3: Retail Investor Platforms (High Volume)
+    "finance.yahoo.com",       # Yahoo Finance - Most visited finance site
+    "marketwatch.com",         # MarketWatch - Dow Jones property
+    "seekingalpha.com",        # Seeking Alpha - Investment research
+    "fool.com",                # Motley Fool - Retail investor focus
+    "thestreet.com",           # TheStreet - Jim Cramer's site
+    "investopedia.com",        # Investopedia - Education + news
+
+    # Tier 4: Trading & Analysis Platforms
+    "benzinga.com",            # Benzinga - Real-time trading news
+    "investing.com",           # Investing.com - Global markets
+    "morningstar.com",         # Morningstar - Fund analysis
+    "zerohedge.com",           # Zero Hedge - Alternative perspective
+
+    # Tier 5: Exchange & Market Data Sites
+    "nasdaq.com",              # NASDAQ official
+    "nyse.com",                # NYSE official
+
+    # Tier 6: General News Business Sections
+    "businessinsider.com",     # Business Insider
+    "cnn.com/business",        # CNN Business
+    "bbc.com/business",        # BBC Business
+    "theguardian.com/business", # Guardian Business
+    "foxbusiness.com",         # Fox Business
+
+    # Tier 7: International Finance
+    "nikkei.com",              # Nikkei Asia
+    "scmp.com",                # South China Morning Post
 ]
 
 
