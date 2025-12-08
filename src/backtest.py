@@ -212,6 +212,9 @@ class PortfolioBacktest:
         turnover = total_change / 2.0
 
         return turnover
+    def compute_sharpe(series):
+        returns = series.pct_change().dropna()
+        return returns.mean() / returns.std()
 
     def _rebalance(
         self,
@@ -282,7 +285,6 @@ class PortfolioBacktest:
         }
 
         return summary
-
 
 def compare_strategies(
     strategies: Dict[str, BaseStrategy],

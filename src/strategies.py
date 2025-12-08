@@ -615,39 +615,62 @@ def create_60_40_strategy(stock_tickers: list, bond_tickers: list) -> StaticStra
     return StaticStrategy(weights)
 
 class RiskAdjustedLSTMStrategy(BaseStrategy):
-    def __init__(self,lookback=30,hidden_dim=32,epochs=20,lr=1e-3):
+    def __init__(self,lookback=30,hidden_dim=32,epochs=30,lr=1e-3,num_layers=1,dropout=0.0,target_horizon=5,vol_window=20):
         super().__init__("Risk Adjusted LSTM")
         self.lookback=lookback
         self.hidden_dim=hidden_dim
         self.epochs=epochs
         self.lr=lr
+        self.num_layers =num_layers
+        self.dropout=dropout
+        self.target_horizon=target_horizon
+        self.vol_window=vol_window
         self.models: Dict[str,torch.nn.Module]={} #this is to ensure one lstm for each ticker
         
-    def _prepare_data(self,series):
-        data=series.pct_change().dropna().values.astype(np.float32)
-        data = (data - data.mean()) / (data.std() + 1e-6)
-        X,Y=[],[]
-        for i in range(len(data)-self.lookback-1):
-            X.append(data[i:i+self.lookback])
-            Y.append(data[i+self.lookback]) #this is for next day returns
-        if len(X)==0:
-            return torch.empty(0), torch.empty(0)
+    def _build_feature_df(self,series):
+        returns=series.pct_change()
+        momentum_5=series.pct_change(5)
+        vol_20=returns.rolling(20).std()
 
-        X = torch.tensor(np.array(X), dtype=torch.float32).unsqueeze(-1)
-        Y = torch.tensor(np.array(Y), dtype=torch.float32).unsqueeze(-1)
+        df=pd.DataFrame({
+            "return1": returns,
+            "momentum5": momentum_5,
+            "vol20": vol_20
+        }).dropna()
 
-        return X,Y
+        # global normalization
+        df=df.apply(lambda c: (c - c.mean()) / (c.std() + 1e-6))
+        return df
+    def _prepare_data(self, series):
+        df=self._build_feature_df(series)
+
+        values=df.values          # shape (N, 4)
+        returns=series.pct_change()
+        # 5-day ahead target
+        future_returns = series.pct_change().shift(-5)
+        future_returns = future_returns.reindex(df.index).fillna(0).values
+
+        X,Y=[], []
+        for i in range(len(values) - self.lookback - 5):
+            X.append(values[i:i + self.lookback])
+            Y.append(future_returns[i + self.lookback])
+
+        return (
+            torch.tensor(X, dtype=torch.float32),
+            torch.tensor(Y, dtype=torch.float32).unsqueeze(-1)
+        )
+
     def _train_model(self,series):
         self.series=pd.Series
         X,Y=self._prepare_data(series)
         if len(X)<10:
-            model=LSTMReturnPredictor(input_dim=1,hidden_dim=self.hidden_dim) #if there isn't enough data
+            model=LSTMReturnPredictor(input_dim=3,hidden_dim=self.hidden_dim,num_layers=self.num_layers) #if there isn't enough data
             return model
-        model=LSTMReturnPredictor(input_dim=1,hidden_dim=self.hidden_dim)
+        model=LSTMReturnPredictor(input_dim=3,hidden_dim=self.hidden_dim,num_layers=self.num_layers)
         optimizer=torch.optim.Adam(model.parameters(),lr=self.lr)
         loss_fn=torch.nn.MSELoss()
         ds=TensorDataset(X,Y)
-        dl=DataLoader(ds,batch_size=32,shuffle=True)
+        dl=DataLoader(TensorDataset(X, Y), batch_size=32, shuffle=True)
         for i in range(self.epochs):
             for x_batch,y_batch in dl:
                 optimizer.zero_grad()
@@ -657,11 +680,11 @@ class RiskAdjustedLSTMStrategy(BaseStrategy):
                 optimizer.step()
         return model
     def _predict_next_return(self,model,series:pd.Series):
-        data=series.pct_change().dropna().values.astype(np.float32)
-        if len(data)<self.lookback:
+        df=self._build_feature_df(series)  # or reuse prepare_data logic
+        if len(series)<self.lookback:
             return 0.0
-        
-        window=torch.tensor(data[-self.lookback:]).unsqueeze(0).unsqueeze(-1)
+        window = df.iloc[-self.lookback:].values
+        window = torch.tensor(window, dtype=torch.float32).unsqueeze(0)
         return float(model(window).item())
     def _calculate_recent_volatility(self,series:pd.Series,window=20):
         returns=series.pct_change().dropna()
@@ -700,12 +723,12 @@ class RiskAdjustedLSTMStrategy(BaseStrategy):
             
         score_values=np.array(list(scores.values()))
         
-        if score_values.sum()<=0:
+        '''if score_values.sum()<=0:
             weights={t:1/len(tickers)for t in tickers}
-        else:
-            exp_scores = np.exp(score_values - np.max(score_values))
-            softmax_scores = exp_scores / exp_scores.sum()
-            weights = {t: softmax_scores[i] for i, t in enumerate(tickers)}
+        else:'''
+        exp_scores = np.exp(score_values - np.max(score_values))
+        softmax_scores = exp_scores / exp_scores.sum()
+        weights = {t: softmax_scores[i] for i, t in enumerate(tickers)}
 
         self.validate_weights(weights)
         return weights
