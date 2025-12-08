@@ -144,7 +144,7 @@ class ETFSentimentDatasetBuilder:
 
         return pd.Series(forward_returns, index=dates)
 
-    def _assign_labels(self, returns: pd.Series) -> pd.Series:
+    def _assign_labels(self, returns: pd.Series) -> List[int]:
         """
         Assign sentiment labels based on forward returns.
 
@@ -155,10 +155,14 @@ class ETFSentimentDatasetBuilder:
         """
         threshold = self.config.min_return_threshold
 
-        labels = pd.Series(index=returns.index, dtype=int)
-        labels[returns > threshold] = 2  # Positive
-        labels[returns < -threshold] = 0  # Negative
-        labels[(returns >= -threshold) & (returns <= threshold)] = 1  # Neutral
+        labels = []
+        for ret in returns:
+            if ret > threshold:
+                labels.append(2)  # Positive
+            elif ret < -threshold:
+                labels.append(0)  # Negative
+            else:
+                labels.append(1)  # Neutral
 
         return labels
 
