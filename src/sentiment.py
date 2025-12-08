@@ -1,60 +1,60 @@
 """
 Sentiment analysis for ETF portfolio optimization.
 
-Uses GDELT for historical news and FinBERT for sentiment scoring.
+Uses GDELT BigQuery for historical news data (2017+) and FinBERT for sentiment scoring.
 Supports caching to avoid repeated API calls during backtesting.
+
+Pipeline:
+1. Query GDELT events/GKG from BigQuery for relevant articles
+2. Fetch headlines from article URLs
+3. Score headlines with FinBERT
+4. Aggregate to daily sentiment features per ETF
 """
 
 import os
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import warnings
+import time
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-# Mapping from ETF tickers to search keywords for GDELT
-# Note: Use simple single-word keywords - GDELT is picky about query syntax
-ETF_KEYWORDS = {
-    # US Equity ETFs - use simple financial terms
-    "SPY": ["stocks", "equities", "market"],
-    "QQQ": ["NASDAQ", "technology", "tech"],
-    "VTI": ["stocks", "equities", "market"],
-    "IWM": ["stocks", "Russell", "smallcap"],
+# Mapping from ETF tickers to GDELT search terms
+# These are used in BigQuery WHERE clauses
+ETF_SEARCH_TERMS = {
+    # US Equity ETFs - search for market-related terms
+    "SPY": ["stock market", "S&P 500", "Wall Street", "equities"],
+    "QQQ": ["NASDAQ", "tech stocks", "technology sector"],
+    "VTI": ["stock market", "US stocks", "equities"],
+    "IWM": ["small cap", "Russell 2000", "small stocks"],
 
     # Bond ETFs
-    "TLT": ["treasury", "bonds", "yields"],
-    "BND": ["bonds", "treasury", "fixed"],
+    "TLT": ["treasury bonds", "interest rates", "Federal Reserve", "yields"],
+    "BND": ["bond market", "fixed income", "treasury"],
 
     # Commodity ETFs
-    "GLD": ["gold", "metals", "commodities"],
+    "GLD": ["gold price", "gold market", "precious metals"],
 
     # International ETFs
-    "VEA": ["Europe", "Japan", "international"],
-    "VWO": ["emerging", "China", "Brazil"],
+    "VEA": ["European stocks", "Japan stocks", "international markets"],
+    "VWO": ["emerging markets", "China stocks", "developing markets"],
 
     # Sector ETFs
-    "XLE": ["oil", "energy", "petroleum"],
+    "XLE": ["oil price", "energy sector", "crude oil", "petroleum"],
 }
 
-# Holdings for fallback to individual stock news
-ETF_HOLDINGS = {
-    "SPY": ["AAPL", "MSFT", "NVDA", "AMZN", "META"],
-    "QQQ": ["MSFT", "NVDA", "AMZN", "META", "AVGO"],
-    "VTI": ["AAPL", "MSFT", "AMZN", "NVDA", "GOOGL"],
-    "TLT": ["TLT"],
-    "BND": ["BND"],
-    "GLD": ["GLD"],
-    "VEA": ["VEA"],
-    "VWO": ["VWO"],
-    "IWM": ["IWM"],
-    "XLE": ["XOM", "CVX"],
-}
+# Finance-focused domains for filtering
+FINANCE_DOMAINS = [
+    "reuters.com", "bloomberg.com", "wsj.com", "ft.com",
+    "cnbc.com", "marketwatch.com", "finance.yahoo.com",
+    "seekingalpha.com", "businessinsider.com", "forbes.com",
+]
 
 
 class FinBertSentiment:
@@ -74,15 +74,19 @@ class FinBertSentiment:
         Args:
             device: 'cuda', 'mps', or 'cpu'. Auto-detected if None.
         """
+        import torch
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
         if device is None:
             if torch.cuda.is_available():
                 device = "cuda"
-            elif torch.backends.mps.is_available():
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                 device = "mps"
             else:
                 device = "cpu"
 
         self.device = device
+        self.torch = torch
         print(f"Loading FinBERT model on {device}...")
 
         self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
@@ -103,7 +107,6 @@ class FinBertSentiment:
         if not text or text.strip() == "":
             return 0.0
 
-        # Truncate very long texts
         text = text[:512]
 
         tokens = self.tokenizer(
@@ -115,12 +118,11 @@ class FinBertSentiment:
         )
         tokens = {k: v.to(self.device) for k, v in tokens.items()}
 
-        with torch.no_grad():
+        with self.torch.no_grad():
             logits = self.model(**tokens).logits
 
-        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+        probs = self.torch.softmax(logits, dim=1).cpu().numpy()[0]
         # FinBERT outputs: [negative, neutral, positive]
-        # Return P(positive) - P(negative)
         return float(probs[2] - probs[0])
 
     def score_batch(self, texts: List[str], batch_size: int = 16) -> List[float]:
@@ -149,164 +151,279 @@ class FinBertSentiment:
             )
             tokens = {k: v.to(self.device) for k, v in tokens.items()}
 
-            with torch.no_grad():
+            with self.torch.no_grad():
                 logits = self.model(**tokens).logits
 
-            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            probs = self.torch.softmax(logits, dim=1).cpu().numpy()
             batch_scores = probs[:, 2] - probs[:, 0]
             scores.extend(batch_scores.tolist())
 
         return scores
 
 
-class GDELTNewsLoader:
+class GDELTBigQueryLoader:
     """
-    Fetches historical news from GDELT Project.
+    Load news data from GDELT using Google BigQuery.
 
-    GDELT provides free access to global news data dating back to 2015+.
-    Uses the gdeltdoc library to query the GDELT DOC 2.0 API.
+    GDELT BigQuery tables:
+    - gdelt-bq.gdeltv2.events: Event records with actors, URLs
+    - gdelt-bq.gdeltv2.gkg: Global Knowledge Graph with themes, tone
+
+    Requires Google Cloud authentication:
+    - Set GOOGLE_APPLICATION_CREDENTIALS environment variable, or
+    - Run `gcloud auth application-default login`
     """
 
-    def __init__(self, cache_dir: str = "data"):
+    def __init__(self, project_id: str = None):
         """
-        Initialize GDELT loader.
+        Initialize BigQuery client.
 
         Args:
-            cache_dir: Directory for caching news data
+            project_id: Google Cloud project ID (optional, uses default if None)
         """
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True)
+        self._available = False
+        self.client = None
 
-        # Try to import gdeltdoc
         try:
-            from gdeltdoc import GdeltDoc, Filters
-            self.gdelt = GdeltDoc()
-            self.Filters = Filters
+            from google.cloud import bigquery
+            self.client = bigquery.Client(project=project_id)
             self._available = True
-        except ImportError:
-            print("Warning: gdeltdoc not installed. Run: pip install gdeltdoc")
-            self._available = False
+            print("BigQuery client initialized successfully")
+        except Exception as e:
+            print(f"BigQuery initialization failed: {e}")
+            print("To use GDELT BigQuery, you need:")
+            print("  1. pip install google-cloud-bigquery")
+            print("  2. Set up Google Cloud authentication:")
+            print("     - Run: gcloud auth application-default login")
+            print("     - Or set GOOGLE_APPLICATION_CREDENTIALS env var")
 
     def is_available(self) -> bool:
-        """Check if GDELT is available."""
         return self._available
 
-    def fetch_news(
+    def query_events(
         self,
-        keywords: List[str],
         start_date: str,
         end_date: str,
-        max_records: int = 250
+        search_terms: List[str] = None,
+        domains: List[str] = None,
+        max_results: int = 10000
     ) -> pd.DataFrame:
         """
-        Fetch news articles from GDELT for given keywords and date range.
+        Query GDELT events table for news URLs.
 
         Args:
-            keywords: List of search keywords
             start_date: Start date (YYYY-MM-DD)
             end_date: End date (YYYY-MM-DD)
-            max_records: Maximum number of records to fetch
+            search_terms: List of terms to search for in actor names/URLs
+            domains: List of domains to filter to (e.g., reuters.com)
+            max_results: Maximum number of results
 
         Returns:
-            DataFrame with columns: date, title, url
+            DataFrame with columns: date, url, goldstein_scale, num_articles
         """
         if not self._available:
-            return pd.DataFrame(columns=["date", "title", "url"])
+            return pd.DataFrame(columns=["date", "url", "goldstein_scale", "num_articles"])
+
+        # Convert dates to GDELT format (YYYYMMDD integer)
+        start_int = int(pd.to_datetime(start_date).strftime("%Y%m%d"))
+        end_int = int(pd.to_datetime(end_date).strftime("%Y%m%d"))
+
+        # Build WHERE clause for search terms
+        where_clauses = [f"SQLDATE BETWEEN {start_int} AND {end_int}"]
+
+        if search_terms:
+            term_conditions = []
+            for term in search_terms:
+                term_conditions.append(f"LOWER(SOURCEURL) LIKE '%{term.lower().replace(' ', '%')}%'")
+            where_clauses.append(f"({' OR '.join(term_conditions)})")
+
+        if domains:
+            domain_conditions = [f"SOURCEURL LIKE '%{d}%'" for d in domains]
+            where_clauses.append(f"({' OR '.join(domain_conditions)})")
+
+        query = f"""
+        SELECT
+            DATE(PARSE_TIMESTAMP('%Y%m%d', CAST(SQLDATE AS STRING))) AS date,
+            SOURCEURL AS url,
+            GoldsteinScale AS goldstein_scale,
+            NumArticles AS num_articles
+        FROM `gdelt-bq.gdeltv2.events`
+        WHERE {' AND '.join(where_clauses)}
+            AND SOURCEURL IS NOT NULL
+            AND SOURCEURL != ''
+        ORDER BY SQLDATE DESC, NumArticles DESC
+        LIMIT {max_results}
+        """
 
         try:
-            # Clean keywords - use only simple terms that work with GDELT
-            # GDELT is picky about special characters and complex queries
-            clean_keywords = []
-            for kw in keywords:
-                # Remove problematic characters and simplify
-                clean_kw = kw.replace("&", " ").replace("/", " ").replace("-", " ")
-                # Take only the first word if it's a phrase (simpler queries work better)
-                clean_keywords.append(clean_kw)
-
-            # Use first keyword only - GDELT works best with simple queries
-            # More keywords often cause parsing errors
-            keyword_query = clean_keywords[0] if clean_keywords else keywords[0]
-
-            # GDELT queries one date range at a time
-            f = self.Filters(
-                keyword=keyword_query,
-                start_date=start_date,
-                end_date=end_date,
-                num_records=max_records,
-            )
-
-            articles = self.gdelt.article_search(f)
-
-            if articles.empty:
-                return pd.DataFrame(columns=["date", "title", "url"])
-
-            # Process results
-            result = pd.DataFrame({
-                "date": pd.to_datetime(articles["seendate"]).dt.date,
-                "title": articles["title"],
-                "url": articles["url"]
-            })
-
-            return result
-
+            df = self.client.query(query).to_dataframe()
+            print(f"  Retrieved {len(df)} events from BigQuery")
+            return df
         except Exception as e:
-            print(f"GDELT query failed: {e}")
-            return pd.DataFrame(columns=["date", "title", "url"])
+            print(f"BigQuery query failed: {e}")
+            return pd.DataFrame(columns=["date", "url", "goldstein_scale", "num_articles"])
 
-    def fetch_news_for_etf(
+    def query_gkg_tone(
         self,
-        etf: str,
         start_date: str,
         end_date: str,
-        max_records_per_month: int = 100
+        themes: List[str] = None,
+        max_results: int = 10000
     ) -> pd.DataFrame:
         """
-        Fetch news for an ETF by querying its associated keywords.
+        Query GDELT GKG (Global Knowledge Graph) for built-in tone scores.
 
-        Handles large date ranges by batching queries by month.
+        GKG provides pre-computed tone scores, which can be faster than
+        fetching headlines and running FinBERT.
 
         Args:
-            etf: ETF ticker symbol
             start_date: Start date (YYYY-MM-DD)
             end_date: End date (YYYY-MM-DD)
-            max_records_per_month: Max records per monthly query
+            themes: GDELT themes to filter by (e.g., ECON_STOCKMARKET)
+            max_results: Maximum results
 
         Returns:
-            DataFrame with news data
+            DataFrame with columns: date, url, tone, themes
         """
-        keywords = ETF_KEYWORDS.get(etf, [etf])
+        if not self._available:
+            return pd.DataFrame(columns=["date", "url", "tone", "themes"])
 
-        if not keywords:
-            return pd.DataFrame(columns=["date", "title", "url"])
+        start_int = int(pd.to_datetime(start_date).strftime("%Y%m%d"))
+        end_int = int(pd.to_datetime(end_date).strftime("%Y%m%d"))
 
-        # Break into monthly chunks to avoid API limits
-        start = pd.to_datetime(start_date)
-        end = pd.to_datetime(end_date)
+        where_clauses = [f"CAST(SUBSTR(CAST(DATE AS STRING), 1, 8) AS INT64) BETWEEN {start_int} AND {end_int}"]
 
-        all_news = []
-        current = start
+        if themes:
+            theme_conditions = [f"Themes LIKE '%{t}%'" for t in themes]
+            where_clauses.append(f"({' OR '.join(theme_conditions)})")
 
-        while current < end:
-            # Get end of current month
-            month_end = min(current + pd.DateOffset(months=1) - pd.DateOffset(days=1), end)
+        query = f"""
+        SELECT
+            PARSE_DATE('%Y%m%d', SUBSTR(CAST(DATE AS STRING), 1, 8)) AS date,
+            DocumentIdentifier AS url,
+            CAST(SPLIT(V2Tone, ',')[OFFSET(0)] AS FLOAT64) AS tone,
+            Themes AS themes
+        FROM `gdelt-bq.gdeltv2.gkg`
+        WHERE {' AND '.join(where_clauses)}
+            AND V2Tone IS NOT NULL
+        ORDER BY date DESC
+        LIMIT {max_results}
+        """
 
-            news = self.fetch_news(
-                keywords=keywords,
-                start_date=current.strftime("%Y-%m-%d"),
-                end_date=month_end.strftime("%Y-%m-%d"),
-                max_records=max_records_per_month
-            )
+        try:
+            df = self.client.query(query).to_dataframe()
+            print(f"  Retrieved {len(df)} GKG records from BigQuery")
+            return df
+        except Exception as e:
+            print(f"BigQuery GKG query failed: {e}")
+            return pd.DataFrame(columns=["date", "url", "tone", "themes"])
 
-            if not news.empty:
-                news["etf"] = etf
-                all_news.append(news)
 
-            current = month_end + pd.DateOffset(days=1)
+class HeadlineScraper:
+    """
+    Scrape headlines from news article URLs.
 
-        if not all_news:
-            return pd.DataFrame(columns=["date", "title", "url", "etf"])
+    Uses parallel requests with rate limiting to fetch headlines efficiently.
+    """
 
-        return pd.concat(all_news, ignore_index=True)
+    def __init__(self, max_workers: int = 10, timeout: int = 5):
+        """
+        Initialize scraper.
+
+        Args:
+            max_workers: Maximum concurrent requests
+            timeout: Request timeout in seconds
+        """
+        self.max_workers = max_workers
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (compatible; research bot)'
+        })
+
+    def fetch_headline(self, url: str) -> Optional[str]:
+        """
+        Fetch headline from a single URL.
+
+        Args:
+            url: Article URL
+
+        Returns:
+            Headline text or None if failed
+        """
+        try:
+            from bs4 import BeautifulSoup
+
+            response = self.session.get(url, timeout=self.timeout)
+            if response.status_code != 200:
+                return None
+
+            soup = BeautifulSoup(response.content, 'html.parser')
+
+            # Try different headline selectors
+            headline = None
+
+            # Try <title> tag
+            if soup.title:
+                headline = soup.title.string
+
+            # Try common headline tags
+            if not headline:
+                for selector in ['h1', 'article h1', '.headline', '.article-title']:
+                    elem = soup.select_one(selector)
+                    if elem:
+                        headline = elem.get_text()
+                        break
+
+            # Try meta tags
+            if not headline:
+                meta = soup.find('meta', property='og:title')
+                if meta:
+                    headline = meta.get('content')
+
+            if headline:
+                return headline.strip()[:500]  # Limit length
+
+            return None
+
+        except Exception:
+            return None
+
+    def fetch_headlines_batch(
+        self,
+        urls: List[str],
+        progress_callback=None
+    ) -> Dict[str, str]:
+        """
+        Fetch headlines from multiple URLs in parallel.
+
+        Args:
+            urls: List of URLs
+            progress_callback: Optional callback for progress updates
+
+        Returns:
+            Dictionary mapping URL to headline
+        """
+        results = {}
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_url = {executor.submit(self.fetch_headline, url): url for url in urls}
+
+            completed = 0
+            for future in as_completed(future_to_url):
+                url = future_to_url[future]
+                try:
+                    headline = future.result()
+                    if headline:
+                        results[url] = headline
+                except Exception:
+                    pass
+
+                completed += 1
+                if progress_callback and completed % 100 == 0:
+                    progress_callback(completed, len(urls))
+
+        return results
 
 
 class SentimentCache:
@@ -337,15 +454,22 @@ class SentimentCache:
         return self.cache_file.exists()
 
 
-def compute_historical_sentiment(
+def compute_sentiment_bigquery(
     start_date: str,
     end_date: str,
     tickers: List[str] = None,
     cache_dir: str = "data",
-    force_refresh: bool = False
+    force_refresh: bool = False,
+    use_gkg_tone: bool = True,
+    max_articles_per_day: int = 100,
 ) -> pd.DataFrame:
     """
-    Compute historical sentiment for ETFs using GDELT + FinBERT.
+    Compute sentiment using GDELT BigQuery + FinBERT.
+
+    Pipeline:
+    1. Query GDELT events/GKG from BigQuery
+    2. Optionally fetch headlines and score with FinBERT
+    3. Aggregate to daily sentiment per ETF
 
     Args:
         start_date: Start date (YYYY-MM-DD)
@@ -353,13 +477,15 @@ def compute_historical_sentiment(
         tickers: List of ETF tickers (uses all if None)
         cache_dir: Cache directory
         force_refresh: If True, recompute even if cached
+        use_gkg_tone: If True, use GDELT's built-in tone scores (faster)
+                      If False, fetch headlines and run FinBERT (more accurate)
+        max_articles_per_day: Max articles to process per day
 
     Returns:
         DataFrame with columns: {ticker}_sentiment for each ticker
-        Index is DatetimeIndex with trading days
     """
     if tickers is None:
-        tickers = list(ETF_KEYWORDS.keys())
+        tickers = list(ETF_SEARCH_TERMS.keys())
 
     cache = SentimentCache(cache_dir)
 
@@ -367,25 +493,20 @@ def compute_historical_sentiment(
     if not force_refresh and cache.is_cached():
         cached = cache.load()
         if cached is not None:
-            # Check if we have all required tickers
             required_cols = [f"{t}_sentiment" for t in tickers]
             if all(col in cached.columns for col in required_cols):
-                # Filter to date range
                 cached = cached.loc[start_date:end_date]
                 if len(cached) > 0:
                     return cached[required_cols]
 
-    print(f"Computing historical sentiment from {start_date} to {end_date}...")
+    print(f"Computing sentiment from {start_date} to {end_date}...")
     print(f"ETFs: {tickers}")
-    print("This may take a while for large date ranges...")
 
-    # Initialize components
-    gdelt = GDELTNewsLoader(cache_dir)
-    finbert = FinBertSentiment()
+    # Initialize BigQuery loader
+    bq = GDELTBigQueryLoader()
 
-    if not gdelt.is_available():
-        print("GDELT not available. Returning zeros.")
-        # Create date range
+    if not bq.is_available():
+        print("BigQuery not available. Returning zeros.")
         dates = pd.date_range(start=start_date, end=end_date, freq="B")
         df = pd.DataFrame(index=dates)
         for ticker in tickers:
@@ -396,32 +517,79 @@ def compute_historical_sentiment(
 
     for ticker in tickers:
         print(f"\nProcessing {ticker}...")
+        search_terms = ETF_SEARCH_TERMS.get(ticker, [ticker])
 
-        # Fetch news
-        news = gdelt.fetch_news_for_etf(
-            etf=ticker,
-            start_date=start_date,
-            end_date=end_date
-        )
+        if use_gkg_tone:
+            # Use GDELT's built-in tone scores (faster)
+            # Map ETFs to GDELT themes
+            theme_map = {
+                "SPY": ["ECON_STOCKMARKET", "ECON_WORLDCURRENCIES"],
+                "QQQ": ["ECON_STOCKMARKET", "TAX_FNCACT_TECH"],
+                "TLT": ["ECON_INTEREST_RATES", "CRISISLEX_CRISISLANG"],
+                "GLD": ["ECON_WORLDCURRENCIES", "ECON_INFLATION"],
+            }
+            themes = theme_map.get(ticker, ["ECON_STOCKMARKET"])
 
-        if news.empty:
-            print(f"  No news found for {ticker}")
-            all_sentiment[f"{ticker}_sentiment"] = pd.Series(dtype=float)
-            continue
+            data = bq.query_gkg_tone(
+                start_date=start_date,
+                end_date=end_date,
+                themes=themes,
+                max_results=50000
+            )
 
-        print(f"  Found {len(news)} articles, scoring with FinBERT...")
+            if data.empty:
+                all_sentiment[f"{ticker}_sentiment"] = pd.Series(dtype=float)
+                continue
 
-        # Score all titles
-        titles = news["title"].fillna("").tolist()
-        scores = finbert.score_batch(titles)
-        news["sentiment"] = scores
+            # Aggregate tone by date
+            # GDELT tone: positive = good, negative = bad (already correct direction)
+            # Normalize to [-1, 1] range (GDELT tone is typically -10 to +10)
+            daily = data.groupby("date")["tone"].mean() / 10.0
+            daily = daily.clip(-1, 1)
 
-        # Aggregate by date
-        daily_sentiment = news.groupby("date")["sentiment"].mean()
-        daily_sentiment.index = pd.to_datetime(daily_sentiment.index)
+        else:
+            # Fetch headlines and score with FinBERT (more accurate but slower)
+            data = bq.query_events(
+                start_date=start_date,
+                end_date=end_date,
+                search_terms=search_terms,
+                domains=FINANCE_DOMAINS,
+                max_results=50000
+            )
 
-        all_sentiment[f"{ticker}_sentiment"] = daily_sentiment
-        print(f"  Got sentiment for {len(daily_sentiment)} days")
+            if data.empty:
+                all_sentiment[f"{ticker}_sentiment"] = pd.Series(dtype=float)
+                continue
+
+            # Sample top articles per day
+            data = data.groupby("date").head(max_articles_per_day)
+
+            print(f"  Fetching headlines for {len(data)} articles...")
+            scraper = HeadlineScraper(max_workers=20)
+            headlines = scraper.fetch_headlines_batch(data["url"].tolist())
+
+            if not headlines:
+                all_sentiment[f"{ticker}_sentiment"] = pd.Series(dtype=float)
+                continue
+
+            # Map headlines back to dates
+            data["headline"] = data["url"].map(headlines)
+            data = data.dropna(subset=["headline"])
+
+            if data.empty:
+                all_sentiment[f"{ticker}_sentiment"] = pd.Series(dtype=float)
+                continue
+
+            print(f"  Scoring {len(data)} headlines with FinBERT...")
+            finbert = FinBertSentiment()
+            data["sentiment"] = finbert.score_batch(data["headline"].tolist())
+
+            # Aggregate by date
+            daily = data.groupby("date")["sentiment"].mean()
+
+        daily.index = pd.to_datetime(daily.index)
+        all_sentiment[f"{ticker}_sentiment"] = daily
+        print(f"  Got sentiment for {len(daily)} days")
 
     # Combine into DataFrame
     df = pd.DataFrame(all_sentiment)
@@ -472,11 +640,30 @@ def compute_sentiment_features(
     return features
 
 
+# Backward compatibility alias
+def compute_historical_sentiment(
+    start_date: str,
+    end_date: str,
+    tickers: List[str] = None,
+    cache_dir: str = "data",
+    force_refresh: bool = False
+) -> pd.DataFrame:
+    """Alias for compute_sentiment_bigquery with default settings."""
+    return compute_sentiment_bigquery(
+        start_date=start_date,
+        end_date=end_date,
+        tickers=tickers,
+        cache_dir=cache_dir,
+        force_refresh=force_refresh,
+        use_gkg_tone=True,  # Use GKG tone for speed
+    )
+
+
 if __name__ == "__main__":
-    # Test the sentiment pipeline
     print("Testing sentiment pipeline...")
 
     # Test FinBERT
+    print("\n1. Testing FinBERT...")
     finbert = FinBertSentiment()
 
     test_texts = [
@@ -490,26 +677,44 @@ if __name__ == "__main__":
         score = finbert.score(text)
         print(f"  Score: {score:+.3f} | {text[:50]}...")
 
-    # Test GDELT (if available)
-    print("\nTesting GDELT...")
-    gdelt = GDELTNewsLoader()
+    # Test BigQuery
+    print("\n2. Testing GDELT BigQuery...")
+    bq = GDELTBigQueryLoader()
 
-    if gdelt.is_available():
+    if bq.is_available():
         # Test with recent date range
         end = datetime.today()
         start = end - timedelta(days=7)
 
-        news = gdelt.fetch_news(
-            keywords=["stocks"],
+        print(f"  Querying events from {start.date()} to {end.date()}...")
+        events = bq.query_events(
             start_date=start.strftime("%Y-%m-%d"),
             end_date=end.strftime("%Y-%m-%d"),
-            max_records=10
+            search_terms=["stock market"],
+            domains=["reuters.com", "bloomberg.com"],
+            max_results=10
         )
 
-        print(f"  Found {len(news)} articles")
-        if not news.empty:
-            print(news.head())
+        if not events.empty:
+            print(f"  Found {len(events)} events")
+            print(events[["date", "url"]].head())
+        else:
+            print("  No events found")
+
+        print("\n  Querying GKG tone...")
+        gkg = bq.query_gkg_tone(
+            start_date=start.strftime("%Y-%m-%d"),
+            end_date=end.strftime("%Y-%m-%d"),
+            themes=["ECON_STOCKMARKET"],
+            max_results=10
+        )
+
+        if not gkg.empty:
+            print(f"  Found {len(gkg)} GKG records")
+            print(f"  Average tone: {gkg['tone'].mean():.2f}")
+        else:
+            print("  No GKG records found")
     else:
-        print("  GDELT not available (install gdeltdoc)")
+        print("  BigQuery not available")
 
     print("\nDone.")
