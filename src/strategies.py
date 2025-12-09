@@ -307,8 +307,7 @@ class PredictiveSharpeStrategy(BaseStrategy):
 
         # Initialize FeatureEngineer for comprehensive feature computation
         self.feature_engineer = FeatureEngineer(
-            lookback_returns=feature_window,
-            lookback_volatility=feature_window
+            lookback_window=feature_window
         )
 
         # Store trained models (one per asset)
