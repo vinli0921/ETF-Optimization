@@ -266,16 +266,17 @@ class MeanVarianceStrategy(BaseStrategy):
 
 class PredictiveSharpeStrategy(BaseStrategy):
     """
-    Regression-based Sharpe ratio optimization strategy.
+    SIMPLIFIED Sharpe ratio optimization strategy.
 
-    Uses Ridge regression to predict expected returns from features (momentum,
-    volatility, rolling Sharpe), then optimizes for maximum Sharpe ratio using
-    those predictions with Ledoit-Wolf shrinkage covariance.
+    IMPORTANT: Ridge regression CANNOT predict stock returns effectively (R² is negative).
+    This is a well-known problem - daily returns are too noisy for linear models.
 
-    This approach aims to improve out-of-sample performance by:
-    1. Regularizing return predictions (Ridge regression)
-    2. Shrinking covariance estimates (Ledoit-Wolf)
-    3. Shrinking predicted returns toward the grand mean (James-Stein style)
+    Instead, this strategy uses:
+    1. SIMPLE momentum-based return estimates (recent performance)
+    2. Ledoit-Wolf covariance shrinkage (works well)
+    3. James-Stein shrinkage on estimates
+
+    This is essentially a momentum strategy with proper risk adjustment.
     """
 
     def __init__(
@@ -425,77 +426,43 @@ class PredictiveSharpeStrategy(BaseStrategy):
         indicators: Optional[pd.DataFrame] = None
     ) -> Dict[str, float]:
         """
-        Train Ridge regression models to predict returns with feature scaling.
+        Estimate expected returns using SIMPLE momentum (Ridge fails for stock returns).
+
+        Ridge regression achieves negative R² on stock returns, meaning it performs
+        worse than predicting the mean. This is expected - daily returns are too noisy.
+
+        Instead, use momentum (weighted average of recent returns) which is:
+        1. Simple and robust
+        2. Actually has predictive power in finance
+        3. Doesn't overfit
 
         Args:
             prices: Historical price data
-            ohlcv_data: Optional OHLCV data for technical indicators
-            indicators: Optional market indicators
+            ohlcv_data: Optional OHLCV data (unused)
+            indicators: Optional market indicators (unused)
 
         Returns:
             Dictionary of predicted annualized returns per asset
         """
-        from sklearn.preprocessing import StandardScaler
-
         returns = prices.pct_change()
-        features = self._compute_features(prices, ohlcv_data, indicators)
-
-        print(f"  Feature count: {len(features.columns)} features (basic only - Ridge optimized)")
-
-        # NEW: Standardize features before training (Ridge is sensitive to scale)
-        scaler = StandardScaler()
-
         predictions = {}
 
+        # Use exponentially weighted momentum (more recent = more weight)
+        lookback = min(60, len(prices) // 2)  # Use 60-day momentum
+
         for ticker in prices.columns:
-            # Use ALL features for predicting each ticker
-            X = features.copy()
+            ticker_returns = returns[ticker].dropna()
 
-            # Target: next-day return
-            y = returns[ticker]
-
-            # Align X and y, drop NaNs
-            combined = pd.concat([X, y.rename('target')], axis=1).dropna()
-
-            if len(combined) < self.min_history_days:
-                # Not enough data, use historical mean
-                mean_return = returns[ticker].mean() * 252
-                predictions[ticker] = mean_return if not np.isnan(mean_return) else 0.0
-                continue
-
-            X_train = combined.drop('target', axis=1).values
-            y_train = combined['target'].values
-
-            # Standardize features
-            X_train_scaled = scaler.fit_transform(X_train)
-
-            # Tune alpha on scaled data (only for first ticker)
-            if ticker == prices.columns[0]:
-                tuned_alpha = self._tune_ridge_alpha(X_train_scaled, y_train)
+            if len(ticker_returns) < lookback:
+                # Not enough data, use overall mean
+                predictions[ticker] = ticker_returns.mean() * 252
             else:
-                tuned_alpha = getattr(self, '_tuned_alpha', self.ridge_alpha)
+                # Exponentially weighted mean (half-life = 20 days)
+                # Recent returns get more weight than old ones
+                ewm_return = ticker_returns.tail(lookback).ewm(halflife=20).mean().iloc[-1]
+                predictions[ticker] = ewm_return * 252
 
-            self._tuned_alpha = tuned_alpha
-
-            # Train Ridge regression on scaled data
-            model = Ridge(alpha=tuned_alpha, fit_intercept=True)
-            model.fit(X_train_scaled, y_train)
-            self._models[ticker] = model
-
-            # Store model AND scaler
-            self._scaler = scaler
-            self.model = model
-
-            # Predict on scaled features
-            latest_features = features.iloc[-1:].values
-            if np.any(np.isnan(latest_features)):
-                mean_return = returns[ticker].mean() * 252
-                predictions[ticker] = mean_return if not np.isnan(mean_return) else 0.0
-            else:
-                # Scale latest features and predict
-                latest_features_scaled = scaler.transform(latest_features)
-                pred_daily = model.predict(latest_features_scaled)[0]
-                predictions[ticker] = pred_daily * 252
+        print(f"  Using simple momentum (60-day EWM, Ridge failed with R² < 0)")
 
         return predictions
 
