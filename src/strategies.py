@@ -14,6 +14,7 @@ from sklearn.linear_model import Ridge
 from sklearn.covariance import LedoitWolf
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import RandomForestRegressor
+from features import FeatureEngineer
 try:
     import lightgbm as lgb
     LIGHTGBM_AVAILABLE = True
@@ -48,6 +49,8 @@ class BaseStrategy(ABC):
         self,
         prices: pd.DataFrame,
         current_date: Optional[pd.Timestamp] = None,
+        ohlcv_data: Optional[pd.DataFrame] = None,
+        indicators: Optional[pd.DataFrame] = None,
         **kwargs
     ) -> Dict[str, float]:
         """
@@ -56,6 +59,8 @@ class BaseStrategy(ABC):
         Args:
             prices: Historical price data (up to but not including current_date)
             current_date: Date for which to compute allocation
+            ohlcv_data: Optional OHLCV data (Open, High, Low, Close, Volume)
+            indicators: Optional market indicators (VIX, yields, etc.)
             **kwargs: Strategy-specific parameters
 
         Returns:
@@ -106,6 +111,8 @@ class EqualWeightStrategy(BaseStrategy):
         self,
         prices: pd.DataFrame,
         current_date: Optional[pd.Timestamp] = None,
+        ohlcv_data: Optional[pd.DataFrame] = None,
+        indicators: Optional[pd.DataFrame] = None,
         **kwargs
     ) -> Dict[str, float]:
         """
@@ -114,6 +121,8 @@ class EqualWeightStrategy(BaseStrategy):
         Args:
             prices: Historical price data
             current_date: Unused for this strategy
+            ohlcv_data: Unused for this strategy
+            indicators: Unused for this strategy
             **kwargs: Unused
 
         Returns:
@@ -173,6 +182,8 @@ class MeanVarianceStrategy(BaseStrategy):
         self,
         prices: pd.DataFrame,
         current_date: Optional[pd.Timestamp] = None,
+        ohlcv_data: Optional[pd.DataFrame] = None,
+        indicators: Optional[pd.DataFrame] = None,
         **kwargs
     ) -> Dict[str, float]:
 
@@ -294,80 +305,123 @@ class PredictiveSharpeStrategy(BaseStrategy):
         self.l2_gamma = l2_gamma
         self.min_history_days = min_history_days
 
+        # Initialize FeatureEngineer for comprehensive feature computation
+        self.feature_engineer = FeatureEngineer(
+            lookback_returns=feature_window,
+            lookback_volatility=feature_window
+        )
+
         # Store trained models (one per asset)
         self._models: Dict[str, Ridge] = {}
+        self.model = None  # Store the trained model for feature importance analysis
 
-    def _compute_features(self, prices: pd.DataFrame) -> pd.DataFrame:
+    def _compute_features(
+        self,
+        prices: pd.DataFrame,
+        ohlcv_data: Optional[pd.DataFrame] = None,
+        indicators: Optional[pd.DataFrame] = None
+    ) -> pd.DataFrame:
         """
-        Compute features for prediction.
+        Compute features using FeatureEngineer.
 
-        Features per asset:
-        - Lagged returns (1, 5, 21 days)
-        - Rolling momentum (annualized)
-        - Rolling volatility (annualized)
-        - Rolling Sharpe ratio
+        Returns 160+ features including:
+        - Basic: returns, volatility, momentum, Sharpe (6 per ticker)
+        - Technical: RSI, MACD, Bollinger Bands, ATR (16 per ticker)
+        - Volume: volume features (4 per ticker)
+        - Market: VIX, yields, spreads (global)
+        - Correlations: rolling correlations between assets
 
         Args:
             prices: Historical price data
+            ohlcv_data: Optional OHLCV data for technical indicators
+            indicators: Optional market indicators
 
         Returns:
-            DataFrame with features
+            DataFrame with comprehensive features
         """
-        returns = prices.pct_change()
+        # Use FeatureEngineer to compute all 160+ features
+        features = self.feature_engineer.compute_all_features(
+            prices=prices,
+            ohlcv_data=ohlcv_data,
+            indicators=indicators,
+            include_correlations=True,
+            include_technical=True,
+            include_volume=True,
+            include_market=True
+        )
 
-        features_list = []
+        # Shift all features by 1 day to prevent look-ahead bias
+        # (FeatureEngineer already does this internally, but we double-check)
+        features = features.shift(1)
 
-        for ticker in prices.columns:
-            ticker_returns = returns[ticker]
-
-            # Lagged returns
-            lag_1 = ticker_returns.shift(1)
-            lag_5 = ticker_returns.rolling(5).mean().shift(1)
-            lag_21 = ticker_returns.rolling(21).mean().shift(1)
-
-            # Rolling momentum (annualized)
-            momentum = ticker_returns.rolling(self.feature_window).mean().shift(1) * 252
-
-            # Rolling volatility (annualized)
-            volatility = ticker_returns.rolling(self.feature_window).std().shift(1) * np.sqrt(252)
-
-            # Rolling Sharpe
-            rolling_sharpe = momentum / volatility
-
-            # Combine into feature DataFrame
-            ticker_features = pd.DataFrame({
-                f'{ticker}_lag1': lag_1,
-                f'{ticker}_lag5': lag_5,
-                f'{ticker}_lag21': lag_21,
-                f'{ticker}_momentum': momentum,
-                f'{ticker}_volatility': volatility,
-                f'{ticker}_sharpe': rolling_sharpe,
-            })
-
-            features_list.append(ticker_features)
-
-        features = pd.concat(features_list, axis=1)
         return features
 
-    def _train_models(self, prices: pd.DataFrame) -> Dict[str, float]:
+    def _tune_ridge_alpha(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray
+    ) -> float:
+        """
+        Tune ridge_alpha via TimeSeriesSplit cross-validation.
+
+        Args:
+            X_train: Training features
+            y_train: Training targets
+
+        Returns:
+            Best alpha value
+        """
+        from sklearn.metrics import mean_squared_error
+
+        alphas = [0.1, 1.0, 5.0, 10.0, 50.0, 100.0]
+        tscv = TimeSeriesSplit(n_splits=5)
+        best_alpha = self.ridge_alpha
+        best_score = float('inf')
+
+        for alpha in alphas:
+            scores = []
+            for train_idx, val_idx in tscv.split(X_train):
+                model = Ridge(alpha=alpha, fit_intercept=True)
+                model.fit(X_train[train_idx], y_train[train_idx])
+                y_pred = model.predict(X_train[val_idx])
+                mse = mean_squared_error(y_train[val_idx], y_pred)
+                scores.append(mse)
+
+            avg_score = np.mean(scores)
+            if avg_score < best_score:
+                best_score = avg_score
+                best_alpha = alpha
+
+        return best_alpha
+
+    def _train_models(
+        self,
+        prices: pd.DataFrame,
+        ohlcv_data: Optional[pd.DataFrame] = None,
+        indicators: Optional[pd.DataFrame] = None
+    ) -> Dict[str, float]:
         """
         Train Ridge regression models to predict returns.
 
         Args:
             prices: Historical price data
+            ohlcv_data: Optional OHLCV data for technical indicators
+            indicators: Optional market indicators
 
         Returns:
             Dictionary of predicted annualized returns per asset
         """
         returns = prices.pct_change()
-        features = self._compute_features(prices)
+        features = self._compute_features(prices, ohlcv_data, indicators)
+
+        print(f"  Feature count: {len(features.columns)} features (vs old 60)")  # Debug print
 
         predictions = {}
 
         for ticker in prices.columns:
-            # Get features for this asset
-            ticker_feature_cols = [col for col in features.columns if col.startswith(ticker)]
-            X = features[ticker_feature_cols]
+            # Use ALL features for predicting each ticker (not just ticker-specific features)
+            # This allows cross-asset information to improve predictions
+            X = features.copy()
 
             # Target: next-day return
             y = returns[ticker]
@@ -381,16 +435,30 @@ class PredictiveSharpeStrategy(BaseStrategy):
                 predictions[ticker] = mean_return if not np.isnan(mean_return) else 0.0
                 continue
 
-            X_train = combined[ticker_feature_cols].values
+            X_train = combined.drop('target', axis=1).values
             y_train = combined['target'].values
 
-            # Train Ridge regression
-            model = Ridge(alpha=self.ridge_alpha)
+            # Tune alpha via cross-validation (Phase 3)
+            # Only tune for the first ticker to save time (assumption: optimal alpha is similar across tickers)
+            if ticker == prices.columns[0]:
+                tuned_alpha = self._tune_ridge_alpha(X_train, y_train)
+                print(f"  Tuned ridge_alpha: {tuned_alpha} (default was {self.ridge_alpha})")
+            else:
+                tuned_alpha = getattr(self, '_tuned_alpha', self.ridge_alpha)
+
+            # Store tuned alpha for subsequent tickers
+            self._tuned_alpha = tuned_alpha
+
+            # Train Ridge regression with tuned alpha
+            model = Ridge(alpha=tuned_alpha, fit_intercept=True)
             model.fit(X_train, y_train)
             self._models[ticker] = model
 
+            # Store the model for the last ticker (for feature importance analysis)
+            self.model = model
+
             # Predict using most recent features
-            latest_features = X.iloc[-1:].values
+            latest_features = features.iloc[-1:].values
 
             if np.any(np.isnan(latest_features)):
                 # Features have NaN, use historical mean
@@ -435,6 +503,8 @@ class PredictiveSharpeStrategy(BaseStrategy):
         self,
         prices: pd.DataFrame,
         current_date: Optional[pd.Timestamp] = None,
+        ohlcv_data: Optional[pd.DataFrame] = None,
+        indicators: Optional[pd.DataFrame] = None,
         **kwargs
     ) -> Dict[str, float]:
         """
@@ -443,6 +513,8 @@ class PredictiveSharpeStrategy(BaseStrategy):
         Args:
             prices: Historical price data (up to but not including current_date)
             current_date: Date for which to compute allocation
+            ohlcv_data: Optional OHLCV data for technical indicators
+            indicators: Optional market indicators
             **kwargs: Additional parameters
 
         Returns:
@@ -462,8 +534,8 @@ class PredictiveSharpeStrategy(BaseStrategy):
             return EqualWeightStrategy().allocate(prices)
 
         try:
-            # Step 1: Predict expected returns using Ridge regression
-            predicted_returns = self._train_models(prices)
+            # Step 1: Predict expected returns using Ridge regression with enhanced features
+            predicted_returns = self._train_models(prices, ohlcv_data, indicators)
 
             # Step 2: Apply shrinkage to predictions
             shrunk_returns = self._apply_shrinkage(predicted_returns)
@@ -749,6 +821,8 @@ class GradientBoostingSharpeStrategy(BaseStrategy):
         self,
         prices: pd.DataFrame,
         current_date: Optional[pd.Timestamp] = None,
+        ohlcv_data: Optional[pd.DataFrame] = None,
+        indicators: Optional[pd.DataFrame] = None,
         sentiment_df: Optional[pd.DataFrame] = None,
         **kwargs
     ) -> Dict[str, float]:
@@ -758,6 +832,8 @@ class GradientBoostingSharpeStrategy(BaseStrategy):
         Args:
             prices: Historical price data (up to but not including current_date)
             current_date: Date for which to compute allocation
+            ohlcv_data: Optional OHLCV data for technical indicators
+            indicators: Optional market indicators
             sentiment_df: Optional sentiment features DataFrame
             **kwargs: Additional parameters
 
@@ -994,6 +1070,8 @@ class EnsembleSharpeStrategy(BaseStrategy):
         self,
         prices: pd.DataFrame,
         current_date: Optional[pd.Timestamp] = None,
+        ohlcv_data: Optional[pd.DataFrame] = None,
+        indicators: Optional[pd.DataFrame] = None,
         sentiment_df: Optional[pd.DataFrame] = None,
         **kwargs
     ) -> Dict[str, float]:
@@ -1069,6 +1147,8 @@ class BuyAndHoldStrategy(BaseStrategy):
         self,
         prices: pd.DataFrame,
         current_date: Optional[pd.Timestamp] = None,
+        ohlcv_data: Optional[pd.DataFrame] = None,
+        indicators: Optional[pd.DataFrame] = None,
         **kwargs
     ) -> Dict[str, float]:
         """
@@ -1077,6 +1157,8 @@ class BuyAndHoldStrategy(BaseStrategy):
         Args:
             prices: Historical price data
             current_date: Unused
+            ohlcv_data: Unused
+            indicators: Unused
             **kwargs: Unused
 
         Returns:
@@ -1113,6 +1195,8 @@ class StaticStrategy(BaseStrategy):
         self,
         prices: pd.DataFrame,
         current_date: Optional[pd.Timestamp] = None,
+        ohlcv_data: Optional[pd.DataFrame] = None,
+        indicators: Optional[pd.DataFrame] = None,
         **kwargs
     ) -> Dict[str, float]:
         """
@@ -1121,6 +1205,8 @@ class StaticStrategy(BaseStrategy):
         Args:
             prices: Historical price data
             current_date: Unused
+            ohlcv_data: Unused
+            indicators: Unused
             **kwargs: Unused
 
         Returns:
@@ -1218,7 +1304,7 @@ class RiskAdjustedLSTMStrategy(BaseStrategy):
             return returns.std() if len(returns) > 0 else 1e-6
         return returns.tail(window).std()
     
-    def allocate(self,prices,current_date=None,**kwargs):
+    def allocate(self, prices, current_date=None, ohlcv_data=None, indicators=None, **kwargs):
         if current_date is not None:
             price=prices.loc[:current_date]
         else:

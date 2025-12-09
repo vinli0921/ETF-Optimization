@@ -53,6 +53,8 @@ class PortfolioBacktest:
         self,
         strategy: BaseStrategy,
         prices: pd.DataFrame,
+        ohlcv_data: Optional[pd.DataFrame] = None,
+        indicators: Optional[pd.DataFrame] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         **strategy_kwargs
@@ -63,6 +65,8 @@ class PortfolioBacktest:
         Args:
             strategy: Strategy to backtest
             prices: Historical price data with DatetimeIndex
+            ohlcv_data: Optional OHLCV data (Open, High, Low, Close, Volume)
+            indicators: Optional market indicators (VIX, yields, etc.)
             start_date: Start date for backtest (None = use first date)
             end_date: End date for backtest (None = use last date)
             **strategy_kwargs: Additional arguments to pass to strategy.allocate()
@@ -73,8 +77,16 @@ class PortfolioBacktest:
         # Filter date range
         if start_date:
             prices = prices[start_date:]
+            if ohlcv_data is not None:
+                ohlcv_data = ohlcv_data[start_date:]
+            if indicators is not None:
+                indicators = indicators[start_date:]
         if end_date:
             prices = prices[:end_date]
+            if ohlcv_data is not None:
+                ohlcv_data = ohlcv_data[:end_date]
+            if indicators is not None:
+                indicators = indicators[:end_date]
 
         if len(prices) == 0:
             raise ValueError("No price data in specified date range")
@@ -104,6 +116,15 @@ class PortfolioBacktest:
                 # This ensures no look-ahead bias
                 historical_prices = prices[:date].iloc[:-1]  # Exclude current date
 
+                # Filter OHLCV and indicators to historical as well
+                historical_ohlcv = None
+                if ohlcv_data is not None:
+                    historical_ohlcv = ohlcv_data[:date].iloc[:-1]
+
+                historical_indicators = None
+                if indicators is not None:
+                    historical_indicators = indicators[:date].iloc[:-1]
+
                 if len(historical_prices) < 10:
                     # Not enough history, use equal weights
                     tickers = prices.columns
@@ -113,6 +134,8 @@ class PortfolioBacktest:
                     weights = strategy.allocate(
                         historical_prices,
                         current_date=date,
+                        ohlcv_data=historical_ohlcv,
+                        indicators=historical_indicators,
                         **strategy_kwargs
                     )
 
