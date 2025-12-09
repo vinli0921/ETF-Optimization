@@ -390,8 +390,14 @@ if __name__ == "__main__":
     from data import load_default_etfs, ETFDataLoader
     from strategies import EqualWeightStrategy, MeanVarianceStrategy
 
-    # Load data
-    prices = load_default_etfs()
+    # Load data (returns tuple: ohlcv_data, indicators)
+    ohlcv_data, indicators = load_default_etfs()
+
+    # Extract Close prices for backward compatibility
+    close_cols = [col for col in ohlcv_data.columns if col.endswith('_Close')]
+    prices = ohlcv_data[close_cols].copy()
+    prices.columns = [col.replace('_Close', '') for col in close_cols]
+
     loader = ETFDataLoader()
     train, val, test = loader.split_train_val_test(prices)
 

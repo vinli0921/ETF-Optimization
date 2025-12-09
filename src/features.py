@@ -697,15 +697,28 @@ if __name__ == "__main__":
     # Example usage
     from data import load_default_etfs, ETFDataLoader
 
-    # Load data
-    prices = load_default_etfs()
+    # Load data (returns tuple: ohlcv_data, indicators)
+    ohlcv_data, indicators = load_default_etfs()
+
+    # Extract Close prices
+    close_cols = [col for col in ohlcv_data.columns if col.endswith('_Close')]
+    prices = ohlcv_data[close_cols].copy()
+    prices.columns = [col.replace('_Close', '') for col in close_cols]
 
     # Create feature engineer
     feature_eng = FeatureEngineer(lookback_window=30)
 
-    # Compute all features
+    # Compute all features (now with OHLCV and indicators)
     print("\nComputing features...")
-    features = feature_eng.compute_all_features(prices)
+    features = feature_eng.compute_all_features(
+        prices=prices,
+        ohlcv_data=ohlcv_data,
+        indicators=indicators,
+        include_correlations=True,
+        include_technical=True,
+        include_volume=True,
+        include_market=True
+    )
 
     print("\n" + "="*80)
     print("Feature Summary")

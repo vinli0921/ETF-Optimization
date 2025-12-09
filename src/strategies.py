@@ -744,13 +744,14 @@ class GradientBoostingSharpeStrategy(BaseStrategy):
                 reg_lambda=0.1,
                 random_state=42,
                 verbose=-1,
+                n_jobs=4,  # Limit CPU usage to avoid allocation warnings
             )
         else:
             return RandomForestRegressor(
                 n_estimators=self.n_estimators,
                 max_depth=self.max_depth,
                 random_state=42,
-                n_jobs=-1,
+                n_jobs=4,  # Limit CPU usage
             )
 
     def _train_models(
@@ -1048,7 +1049,7 @@ class XGBoostSharpeStrategy(BaseStrategy):
                 reg_alpha=self.reg_alpha,
                 reg_lambda=self.reg_lambda,
                 random_state=42,
-                n_jobs=-1,
+                n_jobs=4,  # Limit CPU usage to avoid allocation warnings
                 verbosity=0,
                 enable_categorical=False
             )
@@ -1058,7 +1059,7 @@ class XGBoostSharpeStrategy(BaseStrategy):
                 n_estimators=self.n_estimators,
                 max_depth=self.max_depth,
                 random_state=42,
-                n_jobs=-1
+                n_jobs=4  # Limit CPU usage
             )
 
     def _train_models(
@@ -1372,7 +1373,7 @@ class EnsembleSharpeStrategy(BaseStrategy):
             model_predictions.append(ridge.predict(latest_features)[0] * 252)
 
             # 2. Random Forest
-            rf = RandomForestRegressor(n_estimators=50, max_depth=5, random_state=42, n_jobs=-1)
+            rf = RandomForestRegressor(n_estimators=50, max_depth=5, random_state=42, n_jobs=4)
             rf.fit(X_train, y_train)
             model_predictions.append(rf.predict(latest_features)[0] * 252)
 
@@ -1715,8 +1716,14 @@ if __name__ == "__main__":
     # Example usage
     from data import load_default_etfs, ETFDataLoader
 
-    # Load data
-    prices = load_default_etfs()
+    # Load data (returns tuple: ohlcv_data, indicators)
+    ohlcv_data, indicators = load_default_etfs()
+
+    # Extract Close prices for backward compatibility
+    close_cols = [col for col in ohlcv_data.columns if col.endswith('_Close')]
+    prices = ohlcv_data[close_cols].copy()
+    prices.columns = [col.replace('_Close', '') for col in close_cols]
+
     loader = ETFDataLoader()
     train, val, test = loader.split_train_val_test(prices)
 
