@@ -5,7 +5,7 @@ class LSTMReturnPredictor(nn.Module):
     """
     Simple 1-layer LSTM to predict next-day returns from past returns.
     """
-    def __init__(self,input_dim=1,hidden_dim=32,num_layers=1):
+    def __init__(self,input_dim,hidden_dim,num_layers=1):
         super().__init__()
         self.hidden_dim=hidden_dim
         self.num_layers=num_layers
