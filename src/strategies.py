@@ -17,9 +17,11 @@ from sklearn.ensemble import RandomForestRegressor
 try:
     import lightgbm as lgb
     LIGHTGBM_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
+    # OSError covers missing libomp on macOS; ImportError covers missing package
     LIGHTGBM_AVAILABLE = False
-    print("Warning: lightgbm not installed. GradientBoostingSharpeStrategy will fall back to RandomForest.")
+    print("Warning: lightgbm unavailable (missing package or libomp). "
+          "GradientBoostingSharpeStrategy will fall back to RandomForest.")
 import torch
 import numpy as np
 import pandas as pd
