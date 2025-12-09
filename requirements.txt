@@ -10,6 +10,7 @@ PyPortfolioOpt>=1.5.5
 
 # Machine learning
 lightgbm>=4.0.0
+xgboost>=2.0.0
 shap>=0.42.0
 
 # NLP / Sentiment analysis
@@ -35,3 +36,4 @@ notebook>=6.5.0
 # Utilities
 python-dateutil>=2.8.0
 feedparser
+tqdm>=4.65.0
