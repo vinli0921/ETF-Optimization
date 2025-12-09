@@ -20,8 +20,7 @@ This project dynamically allocates capital across 10 diversified ETFs to maximiz
 - **Strict No-Look-Ahead**: All features use only past data; realistic transaction costs
 - **Comprehensive Comparison**: Baseline, optimization, and ML strategies on the same footing
 
-
-Whether you're a data scientist exploring quantitative finance, a quant researcher comparing strategies, or a student learning portfolio optimization, this framework provides production-ready tools for strategy development and evaluation.
+**→ [See comprehensive demo notebooks](#notebooks)**
 
 
 ## Key Features
@@ -73,8 +72,6 @@ plot_equity_curves({'Mean-Variance': portfolio_values})
 plt.show()
 ```
 
-
-Get from zero to running code in under 5 minutes!
 
 
 ## Repository Structure
@@ -147,8 +144,6 @@ ETF-Optimization/
 - **Equal Weight**: Sharpe **1.50**, 17% annual return, 10% volatility (solid baseline)
 
 
-*Note: Past performance does not guarantee future results. These are backtested figures.*
-
 
 ## Installation
 
@@ -176,7 +171,6 @@ pip install google-cloud-bigquery google-cloud-bigquery-storage
 **System Requirements:**
 - Python 3.8+
 - 4GB+ RAM (for ML strategies with 160+ features)
-- Internet connection (for initial data download from Yahoo Finance)
 
 
 ## Usage Examples
@@ -466,7 +460,7 @@ Mean-Variance          2.13   28.9%      12.6%          8.3%
 ## Advanced: Sentiment Analysis
 
 
-### Optional Feature for Advanced Users
+### Optional Feature (Not working)
 
 
 Integrate news sentiment into allocation decisions using FinBERT and GDELT.
@@ -633,10 +627,10 @@ strategy = XGBoostSharpeStrategy()
 ## Notebooks
 
 
-### Interactive Demo
+### Main Experiments
 
 
-**`baseline_demo.ipynb`** — Complete end-to-end workflow:
+**`baseline_demo.ipynb`** — Run all main experiments with complete end-to-end workflow:
 
 
 1. Load 10 ETFs with OHLCV data (2015-2025)
@@ -656,6 +650,23 @@ jupyter notebook notebooks/baseline_demo.ipynb
 
 
 Run all cells to see the complete pipeline in action (~10 minutes).
+
+
+### Comprehensive ML Experiments
+
+
+**`ml_experiments_baseline.ipynb`** — In-depth machine learning experiments and analysis:
+
+
+- Detailed feature engineering and selection
+- Hyperparameter tuning for ML models
+- Extended performance analysis
+- Advanced visualizations and model comparisons
+
+
+```bash
+jupyter notebook notebooks/ml_experiments_baseline.ipynb
+```
 
 
 ## Performance Benchmarks
