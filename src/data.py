@@ -165,13 +165,26 @@ class ETFDataLoader:
         if not indicators:
             raise ValueError("Failed to download any market indicators")
 
-        # Combine into single DataFrame
-        indicators_df = pd.DataFrame(indicators)
+        # Combine into single DataFrame with proper index alignment
+        # First, find common index across all indicators
+        common_index = None
+        for name, series in indicators.items():
+            if common_index is None:
+                common_index = series.index
+            else:
+                common_index = common_index.union(series.index)
+
+        # Create DataFrame with common index
+        indicators_df = pd.DataFrame(index=common_index.sort_values())
+
+        # Add each indicator, reindexing to common dates
+        for name, series in indicators.items():
+            indicators_df[name] = series
 
         # Forward-fill to handle weekends/holidays (never backfill to avoid look-ahead)
         indicators_df = indicators_df.ffill()
 
-        # Remove any remaining NaN rows
+        # Remove any remaining NaN rows at the beginning
         indicators_df = indicators_df.dropna()
 
         # Save to cache
