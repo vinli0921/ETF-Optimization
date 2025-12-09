@@ -330,14 +330,15 @@ class PredictiveSharpeStrategy(BaseStrategy):
         indicators: Optional[pd.DataFrame] = None
     ) -> pd.DataFrame:
         """
-        Compute features using FeatureEngineer.
+        Compute features using FeatureEngineer with REDUCED feature set.
 
-        Returns 160+ features including:
-        - Basic: returns, volatility, momentum, Sharpe (6 per ticker)
-        - Technical: RSI, MACD, Bollinger Bands, ATR (16 per ticker)
-        - Volume: volume features (4 per ticker)
-        - Market: VIX, yields, spreads (global)
-        - Correlations: rolling correlations between assets
+        Ridge regression struggles with 139 features + ~700 samples (overfitting).
+        Solution: Use only basic features that are most predictive.
+
+        Returns ~60 features:
+        - Basic: returns, volatility, momentum, Sharpe (6 per ticker = 60)
+        - Market: VIX, yields (global indicators)
+        - Skip: Technical indicators, correlations (too many for Ridge)
 
         Args:
             prices: Historical price data
@@ -345,17 +346,17 @@ class PredictiveSharpeStrategy(BaseStrategy):
             indicators: Optional market indicators
 
         Returns:
-            DataFrame with comprehensive features
+            DataFrame with reduced feature set
         """
-        # Use FeatureEngineer to compute all 160+ features
+        # Use ONLY basic features (most predictive, least overfitting)
         features = self.feature_engineer.compute_all_features(
             prices=prices,
             ohlcv_data=ohlcv_data,
             indicators=indicators,
-            include_correlations=True,
-            include_technical=True,
-            include_volume=True,
-            include_market=True
+            include_correlations=False,  # Skip - too many features
+            include_technical=False,     # Skip - Ridge can't use effectively
+            include_volume=False,         # Skip - redundant with basic
+            include_market=True           # Keep - global indicators useful
         )
 
         # Shift all features by 1 day to prevent look-ahead bias
@@ -439,7 +440,7 @@ class PredictiveSharpeStrategy(BaseStrategy):
         returns = prices.pct_change()
         features = self._compute_features(prices, ohlcv_data, indicators)
 
-        print(f"  Feature count: {len(features.columns)} features (vs old 60)")
+        print(f"  Feature count: {len(features.columns)} features (basic only - Ridge optimized)")
 
         # NEW: Standardize features before training (Ridge is sensitive to scale)
         scaler = StandardScaler()
