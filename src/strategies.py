@@ -370,7 +370,12 @@ class PredictiveSharpeStrategy(BaseStrategy):
         y_train: np.ndarray
     ) -> float:
         """
-        Tune ridge_alpha via TimeSeriesSplit cross-validation.
+        Tune ridge_alpha via TimeSeriesSplit cross-validation using R² score.
+
+        Uses R² (coefficient of determination) instead of MSE because:
+        - MSE on tiny daily returns (0.0001) favors shrinking to zero
+        - R² measures explanatory power, rewarding bold predictions
+        - Prevents over-regularization that kills predictive signal
 
         Args:
             X_train: Training features
@@ -379,13 +384,13 @@ class PredictiveSharpeStrategy(BaseStrategy):
         Returns:
             Best alpha value
         """
-        from sklearn.metrics import mean_squared_error
+        from sklearn.metrics import r2_score
 
         # EXPANDED GRID: Add lower values to prevent over-regularization
         alphas = [0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0]
         tscv = TimeSeriesSplit(n_splits=5)
         best_alpha = self.ridge_alpha
-        best_score = float('inf')
+        best_score = -float('inf')  # Higher R² is better
         cv_scores = {}  # Track all scores for debugging
 
         for alpha in alphas:
@@ -394,19 +399,21 @@ class PredictiveSharpeStrategy(BaseStrategy):
                 model = Ridge(alpha=alpha, fit_intercept=True)
                 model.fit(X_train[train_idx], y_train[train_idx])
                 y_pred = model.predict(X_train[val_idx])
-                mse = mean_squared_error(y_train[val_idx], y_pred)
-                scores.append(mse)
+
+                # Use R² score (higher is better)
+                r2 = r2_score(y_train[val_idx], y_pred)
+                scores.append(r2)
 
             avg_score = np.mean(scores)
             cv_scores[alpha] = avg_score
-            if avg_score < best_score:
+            if avg_score > best_score:  # Maximize R², not minimize
                 best_score = avg_score
                 best_alpha = alpha
 
-        # Print top 3 alphas for debugging
-        sorted_alphas = sorted(cv_scores.items(), key=lambda x: x[1])
-        print(f"    Top 3 alphas (alpha, MSE): {sorted_alphas[:3]}")
-        print(f"    Selected alpha: {best_alpha} (MSE: {best_score:.6f})")
+        # Print top 3 alphas for debugging (sorted by R² descending)
+        sorted_alphas = sorted(cv_scores.items(), key=lambda x: x[1], reverse=True)
+        print(f"    Top 3 alphas (alpha, R²): {sorted_alphas[:3]}")
+        print(f"    Selected alpha: {best_alpha} (R²: {best_score:.6f})")
 
         return best_alpha
 
