@@ -165,21 +165,21 @@ class ETFDataLoader:
         if not indicators:
             raise ValueError("Failed to download any market indicators")
 
-        # Combine into single DataFrame with proper index alignment
-        # First, find common index across all indicators
-        common_index = None
+        # Combine into single DataFrame with explicit reindexing
+        # First, find the union of all dates
+        all_dates = set()
         for name, series in indicators.items():
-            if common_index is None:
-                common_index = series.index
-            else:
-                common_index = common_index.union(series.index)
+            all_dates.update(series.index)
 
-        # Create DataFrame with common index
-        indicators_df = pd.DataFrame(index=common_index.sort_values())
+        common_index = pd.DatetimeIndex(sorted(all_dates))
 
-        # Add each indicator, reindexing to common dates
+        # Reindex each series to common dates and combine
+        aligned_indicators = {}
         for name, series in indicators.items():
-            indicators_df[name] = series
+            aligned_indicators[name] = series.reindex(common_index)
+
+        # Create DataFrame from aligned series
+        indicators_df = pd.DataFrame(aligned_indicators, index=common_index)
 
         # Forward-fill to handle weekends/holidays (never backfill to avoid look-ahead)
         indicators_df = indicators_df.ffill()
