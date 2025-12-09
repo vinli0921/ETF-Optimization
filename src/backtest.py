@@ -11,6 +11,13 @@ from typing import Dict, Optional, List, Tuple
 from datetime import datetime
 import warnings
 
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    print("Note: tqdm not available. Install with 'pip install tqdm' for progress bars.")
+
 from strategies import BaseStrategy
 
 
@@ -108,8 +115,19 @@ class PortfolioBacktest:
         # Track previous weights for turnover calculation
         prev_weights = None
 
-        # Iterate through all dates
-        for i, date in enumerate(prices.index):
+        # Iterate through all dates with progress bar
+        date_iterator = enumerate(prices.index)
+        if TQDM_AVAILABLE:
+            date_iterator = tqdm(
+                date_iterator,
+                total=len(prices),
+                desc=f"  Backtesting",
+                unit="day",
+                leave=False,
+                ncols=80
+            )
+
+        for i, date in date_iterator:
             # Check if this is a rebalancing date
             if date in rebalance_dates:
                 # Get historical prices up to (but not including) current date
@@ -125,8 +143,14 @@ class PortfolioBacktest:
                 if indicators is not None:
                     historical_indicators = indicators[:date].iloc[:-1]
 
-                if len(historical_prices) < 10:
+                # Check if strategy has min_history_days attribute, otherwise use 10
+                min_days = getattr(strategy, 'min_history_days', 10)
+
+                if len(historical_prices) < min_days:
                     # Not enough history, use equal weights
+                    # Only print warning on first occurrence
+                    if i == 0:
+                        print(f"  Note: Using equal weights for first {min_days} days (insufficient history)")
                     tickers = prices.columns
                     weights = {ticker: 1.0 / len(tickers) for ticker in tickers}
                 else:

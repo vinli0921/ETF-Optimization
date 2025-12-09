@@ -7,6 +7,7 @@ Implementst baseline strategies including equal weight and mean-variance optimiz
 from abc import ABC, abstractmethod
 import pandas as pd
 import numpy as np
+import warnings
 from typing import Optional, Dict
 from pypfopt import expected_returns, risk_models, objective_functions
 from pypfopt.efficient_frontier import EfficientFrontier
@@ -23,6 +24,12 @@ except (ImportError, OSError):
     LIGHTGBM_AVAILABLE = False
     print("Warning: lightgbm unavailable (missing package or libomp). "
           "GradientBoostingSharpeStrategy will fall back to RandomForest.")
+try:
+    import xgboost as xgb
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+    print("Warning: xgboost unavailable. Install with: conda install -c conda-forge xgboost")
 import torch
 import numpy as np
 import pandas as pd
@@ -224,7 +231,9 @@ class MeanVarianceStrategy(BaseStrategy):
             # Choose optimization objective
             if self.method == "max_sharpe":
                 try:
-                    ef.max_sharpe(risk_free_rate=self.risk_free_rate)
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings('ignore', message='.*max_sharpe.*')
+                        ef.max_sharpe(risk_free_rate=self.risk_free_rate)
                 except Exception:
                     # Fallback to min_volatility if max_sharpe fails
                     # (e.g., when all returns < risk-free rate)
@@ -372,10 +381,12 @@ class PredictiveSharpeStrategy(BaseStrategy):
         """
         from sklearn.metrics import mean_squared_error
 
-        alphas = [0.1, 1.0, 5.0, 10.0, 50.0, 100.0]
+        # EXPANDED GRID: Add lower values to prevent over-regularization
+        alphas = [0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0]
         tscv = TimeSeriesSplit(n_splits=5)
         best_alpha = self.ridge_alpha
         best_score = float('inf')
+        cv_scores = {}  # Track all scores for debugging
 
         for alpha in alphas:
             scores = []
@@ -387,9 +398,15 @@ class PredictiveSharpeStrategy(BaseStrategy):
                 scores.append(mse)
 
             avg_score = np.mean(scores)
+            cv_scores[alpha] = avg_score
             if avg_score < best_score:
                 best_score = avg_score
                 best_alpha = alpha
+
+        # Print top 3 alphas for debugging
+        sorted_alphas = sorted(cv_scores.items(), key=lambda x: x[1])
+        print(f"    Top 3 alphas (alpha, MSE): {sorted_alphas[:3]}")
+        print(f"    Selected alpha: {best_alpha} (MSE: {best_score:.6f})")
 
         return best_alpha
 
@@ -400,7 +417,7 @@ class PredictiveSharpeStrategy(BaseStrategy):
         indicators: Optional[pd.DataFrame] = None
     ) -> Dict[str, float]:
         """
-        Train Ridge regression models to predict returns.
+        Train Ridge regression models to predict returns with feature scaling.
 
         Args:
             prices: Historical price data
@@ -410,16 +427,20 @@ class PredictiveSharpeStrategy(BaseStrategy):
         Returns:
             Dictionary of predicted annualized returns per asset
         """
+        from sklearn.preprocessing import StandardScaler
+
         returns = prices.pct_change()
         features = self._compute_features(prices, ohlcv_data, indicators)
 
-        print(f"  Feature count: {len(features.columns)} features (vs old 60)")  # Debug print
+        print(f"  Feature count: {len(features.columns)} features (vs old 60)")
+
+        # NEW: Standardize features before training (Ridge is sensitive to scale)
+        scaler = StandardScaler()
 
         predictions = {}
 
         for ticker in prices.columns:
-            # Use ALL features for predicting each ticker (not just ticker-specific features)
-            # This allows cross-asset information to improve predictions
+            # Use ALL features for predicting each ticker
             X = features.copy()
 
             # Target: next-day return
@@ -437,35 +458,35 @@ class PredictiveSharpeStrategy(BaseStrategy):
             X_train = combined.drop('target', axis=1).values
             y_train = combined['target'].values
 
-            # Tune alpha via cross-validation (Phase 3)
-            # Only tune for the first ticker to save time (assumption: optimal alpha is similar across tickers)
+            # Standardize features
+            X_train_scaled = scaler.fit_transform(X_train)
+
+            # Tune alpha on scaled data (only for first ticker)
             if ticker == prices.columns[0]:
-                tuned_alpha = self._tune_ridge_alpha(X_train, y_train)
-                print(f"  Tuned ridge_alpha: {tuned_alpha} (default was {self.ridge_alpha})")
+                tuned_alpha = self._tune_ridge_alpha(X_train_scaled, y_train)
             else:
                 tuned_alpha = getattr(self, '_tuned_alpha', self.ridge_alpha)
 
-            # Store tuned alpha for subsequent tickers
             self._tuned_alpha = tuned_alpha
 
-            # Train Ridge regression with tuned alpha
+            # Train Ridge regression on scaled data
             model = Ridge(alpha=tuned_alpha, fit_intercept=True)
-            model.fit(X_train, y_train)
+            model.fit(X_train_scaled, y_train)
             self._models[ticker] = model
 
-            # Store the model for the last ticker (for feature importance analysis)
+            # Store model AND scaler
+            self._scaler = scaler
             self.model = model
 
-            # Predict using most recent features
+            # Predict on scaled features
             latest_features = features.iloc[-1:].values
-
             if np.any(np.isnan(latest_features)):
-                # Features have NaN, use historical mean
                 mean_return = returns[ticker].mean() * 252
                 predictions[ticker] = mean_return if not np.isnan(mean_return) else 0.0
             else:
-                # Predict and annualize
-                pred_daily = model.predict(latest_features)[0]
+                # Scale latest features and predict
+                latest_features_scaled = scaler.transform(latest_features)
+                pred_daily = model.predict(latest_features_scaled)[0]
                 predictions[ticker] = pred_daily * 252
 
         return predictions
@@ -561,7 +582,9 @@ class PredictiveSharpeStrategy(BaseStrategy):
                 ef.add_objective(objective_functions.L2_reg, gamma=self.l2_gamma)
 
             # Maximize Sharpe ratio
-            ef.max_sharpe(risk_free_rate=self.risk_free_rate)
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', message='.*max_sharpe.*')
+                ef.max_sharpe(risk_free_rate=self.risk_free_rate)
 
             # Get cleaned weights
             weights = ef.clean_weights()
@@ -766,7 +789,7 @@ class GradientBoostingSharpeStrategy(BaseStrategy):
                 predictions[ticker] = mean_return if not np.isnan(mean_return) else 0.0
                 continue
 
-            X_train = combined.drop('target', axis=1).values
+            X_train = combined.drop('target', axis=1)  # Keep as DataFrame for feature names
             y_train = combined['target'].values
 
             # Train gradient boosting model
@@ -774,10 +797,10 @@ class GradientBoostingSharpeStrategy(BaseStrategy):
             model.fit(X_train, y_train)
             self._models[ticker] = model
 
-            # Predict using most recent features
-            latest_features = features.iloc[-1:].values
+            # Predict using most recent features (keep as DataFrame)
+            latest_features = features.iloc[-1:]
 
-            if np.any(np.isnan(latest_features)):
+            if latest_features.isna().any().any():
                 # Features have NaN, use historical mean
                 mean_return = returns[ticker].mean() * 252
                 predictions[ticker] = mean_return if not np.isnan(mean_return) else 0.0
@@ -886,7 +909,9 @@ class GradientBoostingSharpeStrategy(BaseStrategy):
 
             # Maximize Sharpe ratio
             try:
-                ef.max_sharpe(risk_free_rate=self.risk_free_rate)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', message='.*max_sharpe.*')
+                    ef.max_sharpe(risk_free_rate=self.risk_free_rate)
             except Exception:
                 # Fallback to min volatility if max_sharpe fails
                 ef = EfficientFrontier(mu, cov_matrix, weight_bounds=(0, effective_max_weight))
@@ -906,6 +931,319 @@ class GradientBoostingSharpeStrategy(BaseStrategy):
 
         except Exception as e:
             print(f"Warning: Gradient boosting optimization failed ({str(e)}), using equal weights")
+            return EqualWeightStrategy().allocate(prices)
+
+
+class XGBoostSharpeStrategy(BaseStrategy):
+    """
+    XGBoost-based Sharpe ratio optimization strategy.
+
+    More conservative than LightGBM (level-wise vs leaf-wise tree growth),
+    better for small datasets with many features. Uses comprehensive
+    feature set from FeatureEngineer (160+ features).
+    """
+
+    def __init__(
+        self,
+        lookback_days: int = 756,
+        feature_window: int = 60,
+        risk_free_rate: float = 0.02,
+        shrinkage_intensity: float = 0.25,
+        max_weight: float = 0.4,
+        l2_gamma: float = 0.01,
+        min_history_days: int = 60,
+        # XGBoost hyperparameters (conservative)
+        n_estimators: int = 100,
+        max_depth: int = 3,
+        learning_rate: float = 0.01,
+        subsample: float = 0.8,
+        colsample_bytree: float = 0.6,
+        reg_alpha: float = 1.0,
+        reg_lambda: float = 10.0,
+    ):
+        """
+        Initialize XGBoost Sharpe strategy.
+
+        Args:
+            lookback_days: Number of trading days of history to use for training.
+            feature_window: Rolling window for feature computation.
+            risk_free_rate: Annual risk-free rate for Sharpe calculation.
+            shrinkage_intensity: How much to shrink predicted returns toward grand mean (0-1).
+            max_weight: Maximum weight per asset (concentration limit).
+            l2_gamma: L2 regularization on portfolio weights.
+            min_history_days: Minimum rows required before using predictions.
+            n_estimators: Number of boosting rounds.
+            max_depth: Maximum tree depth (shallow for regularization).
+            learning_rate: Boosting learning rate.
+            subsample: Row sampling ratio.
+            colsample_bytree: Column sampling ratio (important for 160+ features).
+            reg_alpha: L1 regularization on weights.
+            reg_lambda: L2 regularization on weights.
+        """
+        super().__init__("XGBoost Sharpe")
+        self.lookback_days = lookback_days
+        self.feature_window = feature_window
+        self.risk_free_rate = risk_free_rate
+        self.shrinkage_intensity = shrinkage_intensity
+        self.max_weight = max_weight
+        self.l2_gamma = l2_gamma
+        self.min_history_days = min_history_days
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.learning_rate = learning_rate
+        self.subsample = subsample
+        self.colsample_bytree = colsample_bytree
+        self.reg_alpha = reg_alpha
+        self.reg_lambda = reg_lambda
+
+        # Initialize FeatureEngineer for comprehensive feature computation
+        self.feature_engineer = FeatureEngineer(lookback_window=feature_window)
+
+        # Store trained models (one per asset)
+        self._models: Dict[str, object] = {}
+
+    def _compute_features(
+        self,
+        prices: pd.DataFrame,
+        ohlcv_data: Optional[pd.DataFrame] = None,
+        indicators: Optional[pd.DataFrame] = None
+    ) -> pd.DataFrame:
+        """
+        Compute features using FeatureEngineer.
+
+        Returns 160+ features including technical indicators, volume, market data, correlations.
+
+        Args:
+            prices: Historical price data
+            ohlcv_data: Optional OHLCV data for technical indicators
+            indicators: Optional market indicators
+
+        Returns:
+            DataFrame with comprehensive features
+        """
+        features = self.feature_engineer.compute_all_features(
+            prices=prices,
+            ohlcv_data=ohlcv_data,
+            indicators=indicators,
+            include_correlations=True,
+            include_technical=True,
+            include_volume=True,
+            include_market=True
+        )
+
+        # Shift all features by 1 day to prevent look-ahead bias
+        features = features.shift(1)
+
+        return features
+
+    def _create_model(self):
+        """Create XGBoost model with conservative hyperparameters."""
+        if XGBOOST_AVAILABLE:
+            return xgb.XGBRegressor(
+                n_estimators=self.n_estimators,
+                max_depth=self.max_depth,
+                learning_rate=self.learning_rate,
+                subsample=self.subsample,
+                colsample_bytree=self.colsample_bytree,
+                reg_alpha=self.reg_alpha,
+                reg_lambda=self.reg_lambda,
+                random_state=42,
+                n_jobs=-1,
+                verbosity=0,
+                enable_categorical=False
+            )
+        else:
+            # Fallback to RandomForest if XGBoost unavailable
+            return RandomForestRegressor(
+                n_estimators=self.n_estimators,
+                max_depth=self.max_depth,
+                random_state=42,
+                n_jobs=-1
+            )
+
+    def _train_models(
+        self,
+        prices: pd.DataFrame,
+        ohlcv_data: Optional[pd.DataFrame] = None,
+        indicators: Optional[pd.DataFrame] = None
+    ) -> Dict[str, float]:
+        """
+        Train XGBoost models to predict returns.
+
+        Args:
+            prices: Historical price data
+            ohlcv_data: Optional OHLCV data
+            indicators: Optional market indicators
+
+        Returns:
+            Dictionary of predicted annualized returns per asset
+        """
+        returns = prices.pct_change()
+        features = self._compute_features(prices, ohlcv_data, indicators)
+
+        print(f"  Feature count: {len(features.columns)} features")
+
+        predictions = {}
+
+        for ticker in prices.columns:
+            # Use ALL features for predicting each ticker
+            X = features.copy()
+            y = returns[ticker]
+
+            # Align X and y, drop NaNs
+            combined = pd.concat([X, y.rename('target')], axis=1).dropna()
+
+            if len(combined) < self.min_history_days:
+                # Not enough data, use historical mean
+                mean_return = returns[ticker].mean() * 252
+                predictions[ticker] = mean_return if not np.isnan(mean_return) else 0.0
+                continue
+
+            X_train = combined.drop('target', axis=1)
+            y_train = combined['target'].values
+
+            # Train XGBoost model
+            model = self._create_model()
+            model.fit(X_train, y_train)
+            self._models[ticker] = model
+
+            # Predict using most recent features
+            latest_features = features.iloc[-1:]
+
+            if latest_features.isna().any().any():
+                # Features have NaN, use historical mean
+                mean_return = returns[ticker].mean() * 252
+                predictions[ticker] = mean_return if not np.isnan(mean_return) else 0.0
+            else:
+                # Predict and annualize
+                pred_daily = model.predict(latest_features)[0]
+                predictions[ticker] = pred_daily * 252
+
+        return predictions
+
+    def _apply_shrinkage(self, predictions: Dict[str, float]) -> Dict[str, float]:
+        """
+        Apply James-Stein style shrinkage to predicted returns.
+
+        Args:
+            predictions: Raw predicted returns per asset
+
+        Returns:
+            Shrunk predictions
+        """
+        if not predictions:
+            return predictions
+
+        values = np.array(list(predictions.values()))
+        grand_mean = np.mean(values)
+
+        shrunk = {}
+        for ticker, pred in predictions.items():
+            shrunk[ticker] = (
+                (1 - self.shrinkage_intensity) * pred +
+                self.shrinkage_intensity * grand_mean
+            )
+
+        return shrunk
+
+    def allocate(
+        self,
+        prices: pd.DataFrame,
+        current_date: Optional[pd.Timestamp] = None,
+        ohlcv_data: Optional[pd.DataFrame] = None,
+        indicators: Optional[pd.DataFrame] = None,
+        **kwargs
+    ) -> Dict[str, float]:
+        """
+        Compute portfolio weights using XGBoost predicted returns.
+
+        Args:
+            prices: Historical price data (up to but not including current_date)
+            current_date: Date for which to compute allocation
+            ohlcv_data: Optional OHLCV data for technical indicators
+            indicators: Optional market indicators
+            **kwargs: Additional parameters
+
+        Returns:
+            Dictionary mapping ticker to portfolio weight
+        """
+        # Use only data up to current_date
+        if current_date is not None:
+            prices = prices.loc[:current_date]
+            if ohlcv_data is not None:
+                ohlcv_data = ohlcv_data.loc[:current_date]
+            if indicators is not None:
+                indicators = indicators.loc[:current_date]
+
+        # Use last lookback_days of history
+        if len(prices) > self.lookback_days:
+            prices = prices.iloc[-self.lookback_days:]
+            if ohlcv_data is not None:
+                ohlcv_data = ohlcv_data.iloc[-self.lookback_days:]
+            if indicators is not None:
+                indicators = indicators.iloc[-self.lookback_days:]
+
+        # Require minimum history
+        if len(prices) < self.min_history_days:
+            print(f"Warning: Insufficient data ({len(prices)} days), using equal weights")
+            return EqualWeightStrategy().allocate(prices)
+
+        try:
+            # Step 1: Predict expected returns using XGBoost
+            predicted_returns = self._train_models(prices, ohlcv_data, indicators)
+
+            # Step 2: Apply shrinkage to predictions
+            shrunk_returns = self._apply_shrinkage(predicted_returns)
+
+            # Convert to pandas Series for PyPortfolioOpt
+            mu = pd.Series(shrunk_returns)
+
+            # Step 3: Estimate covariance using Ledoit-Wolf shrinkage
+            returns_df = prices.pct_change().dropna()
+            lw = LedoitWolf().fit(returns_df.values)
+
+            # Convert to annualized covariance matrix
+            cov_matrix = pd.DataFrame(
+                lw.covariance_ * 252,
+                index=prices.columns,
+                columns=prices.columns
+            )
+
+            # Ensure max_weight is feasible
+            n_assets = len(prices.columns)
+            effective_max_weight = max(self.max_weight, 1.0 / n_assets + 0.01)
+
+            # Step 4: Optimize using PyPortfolioOpt
+            ef = EfficientFrontier(mu, cov_matrix, weight_bounds=(0, effective_max_weight))
+
+            # Add L2 regularization
+            if self.l2_gamma > 0:
+                ef.add_objective(objective_functions.L2_reg, gamma=self.l2_gamma)
+
+            # Maximize Sharpe ratio
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', message='.*max_sharpe.*')
+                    ef.max_sharpe(risk_free_rate=self.risk_free_rate)
+            except Exception:
+                # Fallback to min volatility if max_sharpe fails
+                ef = EfficientFrontier(mu, cov_matrix, weight_bounds=(0, effective_max_weight))
+                if self.l2_gamma > 0:
+                    ef.add_objective(objective_functions.L2_reg, gamma=self.l2_gamma)
+                ef.min_volatility()
+
+            # Get cleaned weights
+            weights = ef.clean_weights()
+
+            # Ensure all tickers present
+            for ticker in prices.columns:
+                weights.setdefault(ticker, 0.0)
+
+            self.validate_weights(weights)
+            return weights
+
+        except Exception as e:
+            print(f"Warning: XGBoost optimization failed ({str(e)}), using equal weights")
             return EqualWeightStrategy().allocate(prices)
 
 
