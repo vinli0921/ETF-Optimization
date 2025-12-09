@@ -177,7 +177,9 @@ class PortfolioBacktest:
             return list(dates)
 
         # Use pandas resampling to find period boundaries
-        resampled = pd.Series(1, index=dates).resample(self.rebalance_frequency).first()
+        # Convert deprecated 'M' to 'ME' (month end)
+        freq = 'ME' if self.rebalance_frequency == 'M' else self.rebalance_frequency
+        resampled = pd.Series(1, index=dates).resample(freq).first()
         rebalance_dates = resampled.index.tolist()
 
         # Ensure dates are within available range
