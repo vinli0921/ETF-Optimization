@@ -166,8 +166,14 @@ class ETFDataLoader:
         if not indicators:
             raise ValueError("Failed to download any market indicators")
 
-        # Combine into single DataFrame (simple concatenation without MultiIndex)
-        indicators_df = pd.DataFrame(indicators)
+        # Combine into single DataFrame with explicit concatenation
+        # This handles different indices across indicators
+        all_series = list(indicators.values())
+        all_names = list(indicators.keys())
+
+        # Concatenate along columns (axis=1) to create DataFrame
+        indicators_df = pd.concat(all_series, axis=1)
+        indicators_df.columns = all_names
 
         # Sort by date index
         indicators_df = indicators_df.sort_index()
