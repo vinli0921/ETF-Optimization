@@ -151,7 +151,8 @@ class ETFDataLoader:
                     ticker,
                     start=start_date,
                     end=end_date,
-                    progress=False
+                    progress=False,
+                    auto_adjust=False  # Explicit to silence yfinance warning and keep raw values
                 )
                 if not data.empty:
                     # Use Close price for the indicator value
@@ -165,24 +166,15 @@ class ETFDataLoader:
         if not indicators:
             raise ValueError("Failed to download any market indicators")
 
-        # Combine into single DataFrame with proper index alignment
-        # First, find common index across all indicators
-        common_index = None
-        for name, series in indicators.items():
-            if common_index is None:
-                common_index = series.index
-            else:
-                common_index = common_index.union(series.index)
-
-        # Create DataFrame with common index
-        indicators_df = pd.DataFrame(index=common_index.sort_values())
-
-        # Add each indicator, reindexing to common dates
-        for name, series in indicators.items():
-            indicators_df[name] = series
+        # Combine into single DataFrame with automatic index alignment.
+        # Using concat avoids the pandas "all scalar values" error seen in some environments.
+        indicator_series = [
+            series.rename(name) for name, series in indicators.items() if not series.empty
+        ]
+        indicators_df = pd.concat(indicator_series, axis=1)
 
         # Forward-fill to handle weekends/holidays (never backfill to avoid look-ahead)
-        indicators_df = indicators_df.ffill()
+        indicators_df = indicators_df.sort_index().ffill()
 
         # Remove any remaining NaN rows at the beginning
         indicators_df = indicators_df.dropna()
