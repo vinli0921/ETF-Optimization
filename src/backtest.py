@@ -11,6 +11,13 @@ from typing import Dict, Optional, List, Tuple
 from datetime import datetime
 import warnings
 
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    print("Note: tqdm not available. Install with 'pip install tqdm' for progress bars.")
+
 from strategies import BaseStrategy
 
 
@@ -53,6 +60,8 @@ class PortfolioBacktest:
         self,
         strategy: BaseStrategy,
         prices: pd.DataFrame,
+        ohlcv_data: Optional[pd.DataFrame] = None,
+        indicators: Optional[pd.DataFrame] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         **strategy_kwargs
@@ -63,6 +72,8 @@ class PortfolioBacktest:
         Args:
             strategy: Strategy to backtest
             prices: Historical price data with DatetimeIndex
+            ohlcv_data: Optional OHLCV data (Open, High, Low, Close, Volume)
+            indicators: Optional market indicators (VIX, yields, etc.)
             start_date: Start date for backtest (None = use first date)
             end_date: End date for backtest (None = use last date)
             **strategy_kwargs: Additional arguments to pass to strategy.allocate()
@@ -73,8 +84,16 @@ class PortfolioBacktest:
         # Filter date range
         if start_date:
             prices = prices[start_date:]
+            if ohlcv_data is not None:
+                ohlcv_data = ohlcv_data[start_date:]
+            if indicators is not None:
+                indicators = indicators[start_date:]
         if end_date:
             prices = prices[:end_date]
+            if ohlcv_data is not None:
+                ohlcv_data = ohlcv_data[:end_date]
+            if indicators is not None:
+                indicators = indicators[:end_date]
 
         if len(prices) == 0:
             raise ValueError("No price data in specified date range")
@@ -96,16 +115,42 @@ class PortfolioBacktest:
         # Track previous weights for turnover calculation
         prev_weights = None
 
-        # Iterate through all dates
-        for i, date in enumerate(prices.index):
+        # Iterate through all dates with progress bar
+        date_iterator = enumerate(prices.index)
+        if TQDM_AVAILABLE:
+            date_iterator = tqdm(
+                date_iterator,
+                total=len(prices),
+                desc=f"  Backtesting",
+                unit="day",
+                leave=False,
+                ncols=80
+            )
+
+        for i, date in date_iterator:
             # Check if this is a rebalancing date
             if date in rebalance_dates:
                 # Get historical prices up to (but not including) current date
                 # This ensures no look-ahead bias
                 historical_prices = prices[:date].iloc[:-1]  # Exclude current date
 
-                if len(historical_prices) < 10:
+                # Filter OHLCV and indicators to historical as well
+                historical_ohlcv = None
+                if ohlcv_data is not None:
+                    historical_ohlcv = ohlcv_data[:date].iloc[:-1]
+
+                historical_indicators = None
+                if indicators is not None:
+                    historical_indicators = indicators[:date].iloc[:-1]
+
+                # Check if strategy has min_history_days attribute, otherwise use 10
+                min_days = getattr(strategy, 'min_history_days', 10)
+
+                if len(historical_prices) < min_days:
                     # Not enough history, use equal weights
+                    # Only print warning on first occurrence
+                    if i == 0:
+                        print(f"  Note: Using equal weights for first {min_days} days (insufficient history)")
                     tickers = prices.columns
                     weights = {ticker: 1.0 / len(tickers) for ticker in tickers}
                 else:
@@ -113,6 +158,8 @@ class PortfolioBacktest:
                     weights = strategy.allocate(
                         historical_prices,
                         current_date=date,
+                        ohlcv_data=historical_ohlcv,
+                        indicators=historical_indicators,
                         **strategy_kwargs
                     )
 
@@ -177,7 +224,9 @@ class PortfolioBacktest:
             return list(dates)
 
         # Use pandas resampling to find period boundaries
-        resampled = pd.Series(1, index=dates).resample(self.rebalance_frequency).first()
+        # Convert deprecated 'M' to 'ME' (month end)
+        freq = 'ME' if self.rebalance_frequency == 'M' else self.rebalance_frequency
+        resampled = pd.Series(1, index=dates).resample(freq).first()
         rebalance_dates = resampled.index.tolist()
 
         # Ensure dates are within available range
@@ -341,8 +390,14 @@ if __name__ == "__main__":
     from data import load_default_etfs, ETFDataLoader
     from strategies import EqualWeightStrategy, MeanVarianceStrategy
 
-    # Load data
-    prices = load_default_etfs()
+    # Load data (returns tuple: ohlcv_data, indicators)
+    ohlcv_data, indicators = load_default_etfs()
+
+    # Extract Close prices for backward compatibility
+    close_cols = [col for col in ohlcv_data.columns if col.endswith('_Close')]
+    prices = ohlcv_data[close_cols].copy()
+    prices.columns = [col.replace('_Close', '') for col in close_cols]
+
     loader = ETFDataLoader()
     train, val, test = loader.split_train_val_test(prices)
 
